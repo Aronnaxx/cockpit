@@ -29,8 +29,8 @@ export function quizChip(key, hasDraft = false) {
   const q = quizOf(key);
   const g = quizGate();
   if (!q?.total) return hasDraft ? { label: "QUIZ: NOT TAKEN", tone: g.on ? "warning" : "muted", tooltip: g.on ? `Posting needs ${g.pass}% on the quiz` : "Quiz me is on the PR page" } : null;
-  if (q.answered < q.total) return { label: `QUIZ ${q.answered}/${q.total}`, tone: "info", tooltip: `${q.answered} of ${q.total} answered, ${q.right} right` };
+  if (q.answered < q.total) return { label: `QUIZ ${q.answered}/${q.total} ANSWERED`, tone: "info", tooltip: `${q.answered} of ${q.total} answered` };
   const pct = Math.round((q.right / q.total) * 100);
   const passed = pct >= (g.on ? g.pass : 75);
-  return { label: `QUIZ ${q.right}/${q.total}`, tone: passed ? "success" : "destructive", tooltip: `${pct}%${g.on ? `, ${g.pass}% needed to post` : ""}${q.stale ? " · written for an older head" : ""}` };
+  return { label: `QUIZ ${q.right}/${q.total} RIGHT`, tone: passed ? "success" : "destructive", tooltip: `${pct}%${g.on ? `, ${g.pass}% needed to post` : ""}${q.stale ? " · written for an older head" : ""}` };
 }

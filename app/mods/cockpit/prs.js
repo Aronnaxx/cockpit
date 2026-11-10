@@ -22,6 +22,8 @@ import { openInSpace, prWorktree, LAUNCH_AGENTS, launchAgent, lastAgent, prPromp
 import { OmoModel } from "./agentsui.js";
 
 const keyOf = (p) => `${p.repo}#${p.number}`;
+/** A quiz answer is right: the right choice, or a fill-in-the-blank that matched. */
+const isRight = (q, a) => (q?.kind === "blank" ? a?.right === true : a != null && a === q?.answer);
 const TASKS = {
   author: [["fix", "Address comments and CI"], ["rebase", "Rebase onto main"]],
   reviewer: [["review", "Review it"], ["rereview", "Re-review (only what changed)"]],
@@ -90,6 +92,7 @@ export default class Prs {
     // Threads that wait on you: what their replies say and the responses drafted (bin/cockpit-explain.py reply), by thread.
     this.replies = new Map();
     this.replyBusy = new Set();
+    this.blanks = new Map(); // "<key>:<question>" -> the answer field of a fill-in-the-blank
     this.quiz = new Map(); // key -> the quiz (bin/cockpit-explain.py quiz) with your answers | "loading" | {error}
     this.explain = new Map(); // key -> the explanation (bin/cockpit-explain.py) | "loading" | {error}
     // The review drafts on disk (what "In progress" lists with the agents working on a PR): key -> {comments, verdict}.
@@ -182,7 +185,7 @@ export default class Prs {
             const total = (d.questions ?? []).length;
             const answers = d.answers ?? {};
             const pr = this.list().find((x) => keyOf(x) === key);
-            if (total) out[key] = { total, answered: Object.keys(answers).length, right: (d.questions ?? []).filter((q, i) => answers[i] === q.answer).length, stale: Boolean(pr && d.head && pr.head && d.head !== pr.head) };
+            if (total) out[key] = { total, answered: Object.keys(answers).length, right: (d.questions ?? []).filter((q, i) => isRight(q, answers[i])).length, stale: Boolean(pr && d.head && pr.head && d.head !== pr.head) };
           } catch {}
         }
         for (const key of next.keys()) out[key] = { ...(out[key] ?? {}), draft: true };
@@ -270,7 +273,7 @@ export default class Prs {
           if (e && (!d || e.at > (d.at ?? 0))) map.set(keyOf(j.p), { error: e.error });
           else if (d) {
             map.set(keyOf(j.p), d);
-            if (j.kind === "quiz") for (const q of d.questions ?? []) if (q.path) this.drafts.ensureFile(cx, j.p, q.path);
+            if (j.kind === "quiz") this.prepQuiz(cx, j.p, d);
           } else map.set(keyOf(j.p), { error: "it stopped without an answer" });
         } catch {
           map.set(keyOf(j.p), { error: "its answer could not be read" });
@@ -714,7 +717,7 @@ export default class Prs {
         try {
           const d = JSON.parse(text);
           this.quiz.set(keyOf(p), d);
-          for (const q of d.questions ?? []) if (q.path) this.drafts.ensureFile(cx, p, q.path);
+          this.prepQuiz(cx, p, d);
         } catch {}
       }
       cx.notify();
@@ -747,7 +750,10 @@ export default class Prs {
       }
       return a;
     };
+    for (const st of this.blanks.values()) st.set_value("");
+    this.keepGoing?.delete(keyOf(p));
     for (const q of d.questions) {
+      if (q.kind === "blank") continue;
       const order = shuffle(q.choices.map((_, i) => i));
       q.answer = order.indexOf(q.answer);
       q.choices = order.map((i) => q.choices[i]);
@@ -767,6 +773,42 @@ export default class Prs {
   }
 
   /** Your answer, kept in the quiz's file so the score stays. */
+  /** A quiz's files read for its code, and an answer field for each blank (made here, not in render). */
+  prepQuiz(cx, p, d) {
+    for (const q of d.questions ?? []) {
+      for (const path of [q.code?.path, q.path]) if (path) this.drafts.ensureFile(cx, p, path);
+      if (q.kind === "blank") {
+        const key = `${keyOf(p)}:${q.question}`;
+        if (!this.blanks.has(key)) {
+          const st = InputState.new({ placeholder: "your answer" });
+          st.on("submit", (_e, cx) => this.answerBlank(cx, p, q));
+          this.blanks.set(key, st);
+        }
+      }
+    }
+  }
+
+  /** A fill-in-the-blank checked against the spellings that count (case, quotes and spaces aside). */
+  answerBlank(cx, p, q) {
+    const d = this.quiz.get(keyOf(p));
+    const qi = d?.questions?.indexOf(q) ?? -1;
+    const st = this.blanks.get(`${keyOf(p)}:${q.question}`);
+    const text = st?.value().trim() ?? "";
+    if (qi < 0 || !text) return;
+    const norm = (x) => String(x).toLowerCase().replace(/[`'"“”]/g, "").replace(/\s+/g, " ").trim();
+    const right = (q.accepted ?? []).some((a) => norm(a) === norm(text) || (Number.isFinite(Number(a)) && Number(a) === Number(text)));
+    this.answer(cx, p, qi, { text, right });
+  }
+
+  /** A quiz's small flowchart (a question's or an explanation's), drawn like Explain's. */
+  quizDiagram(k, id, dg) {
+    if (!dg?.nodes?.length) return null;
+    const g = flowGraph({ direction: dg.direction === "right" ? "right" : "down", nodes: dg.nodes.map((n) => ({ id: n.id, label: n.label, kind: n.kind === "box" ? null : n.kind })), edges: (dg.edges ?? []).map((e) => ({ ...e, label: e.label || null })) });
+    const L = laidOut(`quiz:${id}:${JSON.stringify(dg)}`, g);
+    const room = Math.max(320, (this.width ?? 1100) - 140);
+    return h_flex().w_full().justify_center().py(4).child(Graph(id, L, { scale: Math.min(1, fit(graphSize(L).w, room, 0.4)) }));
+  }
+
   answer(cx, p, qi, choice) {
     const d = this.quiz.get(keyOf(p));
     if (!d?.questions || d.answers?.[qi] != null) return;
@@ -788,7 +830,7 @@ export default class Prs {
     if (!d?.questions?.length) return null;
     const a = d.answers ?? {};
     const answered = Object.keys(a).length;
-    return { answered, right: d.questions.filter((q, i) => a[i] === q.answer).length, total: d.questions.length };
+    return { answered, right: d.questions.filter((q, i) => isRight(q, a[i])).length, total: d.questions.length };
   }
 
   /** Quiz me: questions on the change and on the draft's comments, so what you post is what you understand. */
@@ -796,10 +838,18 @@ export default class Prs {
     const x = this.quiz.get(keyOf(p));
     const ready = x && x !== "loading" && !x.error && x.questions;
     const sc = this.quizScore(p);
+    // quiz.reveal "end": no right or wrong until every question is answered. quiz.gate: the pass mark that posting needs.
+    const atEnd = this.cfg?.quiz?.reveal === "end";
+    const gateOn = this.cfg?.quiz?.gate === true;
+    const passMark = Number(this.cfg?.quiz?.pass ?? 75);
+    const allDone = Boolean(sc) && sc.answered === sc.total;
+    const reveal = !atEnd || allDone;
+    // Out of reach: even every remaining answer right would not make the pass mark, so posting needs another go.
+    const outOfReach = gateOn && reveal && sc && !allDone && ((sc.right + (sc.total - sc.answered)) * 100) / sc.total < passMark && !this.keepGoing?.has(keyOf(p));
     const head = v_flex().gap(10).p(14).rounded(RADIUS.lg).border_1().border_color(k.border).bg(k.card)
       .child(h_flex().gap(8).items_center().child(Icon("circle-help", { size: 16, color: k.ring })).child(div().text_size(TEXT.base).font_semibold().child("Quiz me on this pull request")).child(div().flex_1())
         .when(ready && x.head !== p.head, (e) => e.child(Badge("written for an older head", "warning")))
-        .when(Boolean(sc), (e) => e.child(Badge(`${sc.right}/${sc.total} right${sc.answered < sc.total ? ` · ${sc.total - sc.answered} to go` : ""}`, sc.answered < sc.total ? "secondary" : sc.right / sc.total >= 0.75 ? "success" : "warning"))))
+        .when(Boolean(sc), (e) => e.child(Badge(atEnd && sc.answered < sc.total ? `${sc.answered} of ${sc.total} answered` : sc.answered < sc.total ? `${sc.answered} of ${sc.total} answered · ${sc.right} right${sc.answered - sc.right ? ` · ${sc.answered - sc.right} wrong` : ""}` : `${sc.right} of ${sc.total} right`, sc.answered < sc.total ? "secondary" : sc.right / sc.total >= passMark / 100 ? "success" : "warning"))))
       .child(div().text_size(TEXT.xs).text_color(k.mutedFg).child("Before your name goes on the review: what the change does, how it behaves, and whether the agent's comments hold up. Answer first; the why shows after."))
       .when(Boolean(ready), (e) => e.child(h_flex().gap(6).items_center().child(Badge(`${{ basics: "Basics", standard: "Standard", deep: "Deep" }[x.difficulty] ?? "Standard"} · ${x.questions.length} questions`, "secondary")).when(Boolean(x.focus), (y) => y.child(Badge("on what you missed", "info"))).child(Button("prs-quiz-settings", { label: "Difficulty and length…", size: "sm", variant: "ghost", tooltip: "In Cockpit settings: AI", onClick: () => openSettings("ai") }))))
       .child(h_flex().gap(8).items_start().child(div().flex_1().min_w(0).child(this.explainModel.element(k, "quiz"))).child(Button("prs-quiz-go", { label: x === "loading" ? "Writing…" : ready ? "New quiz" : "Write the quiz", icon: "sparkles", size: "sm", disabled: x === "loading" || !this.explainModel.value(), tooltip: this.explainModel.value() ? undefined : "Pick a model first", onClick: (_e, cx) => this.writeQuiz(cx, p) })));
@@ -808,42 +858,69 @@ export default class Prs {
     if (x.error) return v_flex().gap(12).child(head).child(div().p(10).rounded(RADIUS.md).bg(alpha(k.destructive, 0.1)).text_size(TEXT.sm).child(x.error));
     const ABOUT = { behaviour: "How it behaves", design: "Why it is built this way", risk: "What could break", comment: "An agent's comment" };
     const answers = x.answers ?? {};
+    const reach = outOfReach
+      ? h_flex().gap(10).p(12).items_center().rounded(RADIUS.lg).border_1().border_color(alpha(k.warning, 0.6)).bg(alpha(k.warning, 0.08))
+          .child(Icon("triangle-alert", { size: 15, color: k.warning }))
+          .child(v_flex().flex_1().min_w(0).gap(1).child(div().text_size(TEXT.sm).font_semibold().text_color(k.foreground).child(`This quiz can't reach ${passMark}% any more`)).child(div().text_size(TEXT.xs).text_color(k.mutedFg).child(`${sc.answered - sc.right} wrong of ${sc.total}: posting the review needs another go. Finish it to read every explanation, or start over now.`)))
+          .child(Button("prs-quiz-keep", { label: "Keep going", size: "sm", variant: "ghost", onClick: (_e, cx) => { (this.keepGoing ??= new Set()).add(keyOf(p)); cx.notify(); } }))
+          .child(Button("prs-quiz-missed-now", { label: "New questions on what I missed", icon: "sparkles", size: "sm", variant: "outline", onClick: (_e, cx) => this.retake(cx, p, "missed") }))
+          .child(Button("prs-quiz-again-now", { label: "Quiz again", icon: "rotate-ccw", size: "sm", variant: "outline", onClick: (_e, cx) => this.retake(cx, p, "same") }))
+      : null;
     return v_flex()
       .gap(12)
       .child(head)
+      .children([reach].filter(Boolean))
       .children(
         x.questions.map((q, i) => {
           const got = answers[i];
-          const done = got != null;
-          const range = q.start_line ? `${q.start_line}-${q.line}` : q.line ? String(q.line) : "";
-          return v_flex().id(`qz-${i}`).gap(10).p(14).rounded(RADIUS.lg).border_1().border_color(!done ? k.border : got === q.answer ? alpha(k.success, 0.6) : alpha(k.destructive, 0.6)).bg(k.card)
-            .child(h_flex().gap(8).items_center().child(div().text_size(TEXT.xs).text_color(k.dim).child(`${i + 1} / ${x.questions.length}`)).child(Badge(ABOUT[q.about] ?? q.about, q.about === "comment" ? "info" : "secondary")).when(Boolean(q.path), (e) => e.child(Mono(`${q.path}${range ? `:${range}` : ""}`, { size: TEXT.xs, color: k.mutedFg }))))
-            .children(q.path && q.about === "comment" ? [this.drafts.snippet(k, p, q.path, range)].filter(Boolean) : [])
+          const answered = got != null;
+          const done = answered && reveal;
+          const ok = isRight(q, got);
+          const code = q.code ?? (q.path ? { path: q.path, start: q.start_line ?? q.line, end: q.line } : null);
+          const range = code?.start ? (code.end && code.end !== code.start ? `${code.start}-${code.end}` : String(code.start)) : "";
+          const blank = q.kind === "blank";
+          const field = blank ? this.blanks.get(`${keyOf(p)}:${q.question}`) : null;
+          return v_flex().id(`qz-${i}`).gap(10).p(14).rounded(RADIUS.lg).border_1().border_color(!done ? (answered ? alpha(k.ring, 0.5) : k.border) : ok ? alpha(k.success, 0.6) : alpha(k.destructive, 0.6)).bg(k.card)
+            .child(h_flex().gap(8).items_center().child(div().text_size(TEXT.xs).text_color(k.dim).child(`${i + 1} / ${x.questions.length}${answered && !done ? " · answered" : ""}`)).child(Badge(ABOUT[q.about] ?? q.about, q.about === "comment" ? "info" : "secondary")).when(blank, (e) => e.child(Badge("fill in the blank", "secondary"))).when(Boolean(code), (e) => e.child(Mono(`${code.path}${range ? `:${range}` : ""}`, { size: TEXT.xs, color: k.mutedFg }))))
+            // What it is about: the lines (always shown), and for a comment question the comment itself.
+            .children(code && range ? [this.drafts.snippet(k, p, code.path, range) ?? h_flex().gap(8).items_center().text_size(TEXT.xs).text_color(k.dim).child(Spinner({ size: 10 })).child("Reading the code…")] : [])
+            .when(Boolean(q.comment_body), (e) => e.child(v_flex().gap(4).p(10).rounded(RADIUS.md).border_l_2().border_color(k.warning).bg(alpha(k.warning, 0.06)).child(div().text_size(TEXT.xs).font_semibold().text_color(k.warning).child("The agent's comment")).child(TextView.markdown(`qz-c-${keyOf(p)}-${i}`, q.comment_body).selectable(true).w_full())))
+            .children([this.quizDiagram(k, `qz-d-${keyOf(p)}-${i}`, q.diagram)].filter(Boolean))
             .child(TextView.markdown(`qz-q-${keyOf(p)}-${i}`, q.question).selectable(true).w_full())
             .child(
-              v_flex().gap(6).children(
-                q.choices.map((c, j) => {
-                  const right = j === q.answer, mine = j === got;
-                  const tone = !done ? null : right ? k.success : mine ? k.destructive : null;
-                  return h_flex().id(`qz-${i}-${j}`).gap(10).px(10).py(8).items_start().rounded(RADIUS.md).border_1()
-                    .border_color(tone ? alpha(tone, 0.7) : k.border).bg(tone ? alpha(tone, 0.08) : k.background)
-                    .when(!done, (e) => e.cursor_pointer().hover((h) => h.bg(k.accent)).on_click((_e, cx) => this.answer(cx, p, i, j)))
-                    .child(div().w(18).flex_none().text_size(TEXT.sm).font_semibold().text_color(tone ?? k.mutedFg).child(done && right ? "✓" : done && mine ? "✗" : "ABCD"[j] ?? "·"))
-                    .child(div().flex_1().min_w(0).text_size(TEXT.sm).whitespace_normal().text_color(k.foreground).child(c));
-                }),
-              ),
+              blank
+                ? answered
+                  ? h_flex().gap(10).px(10).py(8).items_center().rounded(RADIUS.md).border_1().border_color(alpha(ok ? k.success : k.destructive, 0.7)).bg(alpha(ok ? k.success : k.destructive, 0.08))
+                      .when(!done, (x2) => x2.border_color(k.border).bg(k.background))
+                      .child(div().text_size(TEXT.sm).font_semibold().text_color(!done ? k.mutedFg : ok ? k.success : k.destructive).child(!done ? "·" : ok ? "✓" : "✗"))
+                      .child(Mono(got.text, { size: TEXT.sm, color: k.foreground }))
+                      .child(div().flex_1())
+                      .when(done && !ok, (x2) => x2.child(div().text_size(TEXT.xs).text_color(k.mutedFg).child(`right: ${(q.accepted ?? []).join(" or ")}`)))
+                  : h_flex().gap(8).items_center().child(div().flex_1().min_w(0).child(field ? TextField(field) : div())).child(Button(`qz-b-${i}`, { label: "Check", size: "sm", variant: "outline", onClick: (_e, cx) => this.answerBlank(cx, p, q) }))
+                : v_flex().gap(6).children(
+                    q.choices.map((c, j) => {
+                      const right = j === q.answer, mine = j === got;
+                      // Hidden until the end: your pick is marked, not whether it was right.
+                      const tone = !answered ? null : !done ? (mine ? k.ring : null) : right ? k.success : mine ? k.destructive : null;
+                      return h_flex().id(`qz-${i}-${j}`).gap(10).px(10).py(8).items_start().rounded(RADIUS.md).border_1()
+                        .border_color(tone ? alpha(tone, 0.7) : k.border).bg(tone ? alpha(tone, 0.08) : k.background)
+                        .when(!answered, (e) => e.cursor_pointer().hover((h) => h.bg(k.accent)).on_click((_e, cx) => this.answer(cx, p, i, j)))
+                        .child(div().w(18).flex_none().text_size(TEXT.sm).font_semibold().text_color(tone ?? k.mutedFg).child(done && right ? "✓" : done && mine ? "✗" : "ABCD"[j] ?? "·"))
+                        .child(div().flex_1().min_w(0).text_size(TEXT.sm).whitespace_normal().text_color(k.foreground).child(c));
+                    }),
+                  ),
             )
-            .when(done, (e) => e.child(v_flex().gap(4).p(10).rounded(RADIUS.md).border_l_2().border_color(got === q.answer ? k.success : k.destructive).bg(alpha(k.info, 0.05)).child(div().text_size(TEXT.xs).font_semibold().text_color(got === q.answer ? k.success : k.destructive).child(got === q.answer ? "Right" : "Not quite")).child(TextView.markdown(`qz-x-${keyOf(p)}-${i}`, q.explain ?? "").selectable(true).w_full())));
+            .when(done, (e) => e.child(v_flex().gap(6).p(10).rounded(RADIUS.md).border_l_2().border_color(ok ? k.success : k.destructive).bg(alpha(k.info, 0.05)).child(div().text_size(TEXT.xs).font_semibold().text_color(ok ? k.success : k.destructive).child(ok ? "Right" : "Not quite")).child(TextView.markdown(`qz-x-${keyOf(p)}-${i}`, q.explain ?? "").selectable(true).w_full()).children([this.quizDiagram(k, `qz-xd-${keyOf(p)}-${i}`, q.explain_diagram)].filter(Boolean))));
         }),
       )
       .when(Boolean(sc) && sc.answered > 0, (e) => {
-        const done = sc.answered === sc.total, good = sc.right / sc.total >= 0.75, wrong = sc.answered - sc.right;
+        const done = sc.answered === sc.total, good = (sc.right * 100) / sc.total >= passMark, wrong = sc.answered - sc.right;
         return e.child(
           v_flex().gap(10).p(14).rounded(RADIUS.lg).bg(alpha(!done ? k.muted : good ? k.success : k.warning, done ? 0.1 : 0.5))
-            .child(div().text_size(TEXT.sm).child(!done ? `${sc.answered} of ${sc.total} answered so far, ${sc.right} right.` : good ? `${sc.right} of ${sc.total}: you know this change.` : `${sc.right} of ${sc.total}: worth another look before posting. Explain and Files changed have the parts you missed.`))
+            .child(div().text_size(TEXT.sm).child(!done ? (atEnd ? `${sc.answered} of ${sc.total} answered: the answers show once you finish.` : `${sc.answered} of ${sc.total} answered so far, ${sc.right} right.`) : good ? `${sc.right} of ${sc.total}: you know this change.` : `${sc.right} of ${sc.total}: worth another look before posting. Explain and Files changed have the parts you missed.`))
             .child(h_flex().gap(8).flex_wrap().items_center()
               .child(Button("prs-quiz-retake", { label: "Quiz again", icon: "rotate-ccw", size: "sm", variant: "outline", tooltip: "The same questions, choices shuffled, your answers cleared", onClick: (_e, cx) => this.retake(cx, p, "same") }))
-              .when(wrong > 0, (x) => x.child(Button("prs-quiz-missed", { label: `New questions on what I missed · ${wrong}`, icon: "sparkles", size: "sm", variant: "outline", tooltip: "New questions on the same parts of the code, asked another way", onClick: (_e, cx) => this.retake(cx, p, "missed") })))
+              .when(wrong > 0 && reveal, (x) => x.child(Button("prs-quiz-missed", { label: `New questions on what I missed · ${wrong}`, icon: "sparkles", size: "sm", variant: "outline", tooltip: "New questions on the same parts of the code, asked another way", onClick: (_e, cx) => this.retake(cx, p, "missed") })))
               .child(Button("prs-quiz-new", { label: "New questions", icon: "sparkles", size: "sm", variant: "ghost", onClick: (_e, cx) => this.writeQuiz(cx, p) }))
               .child(div().flex_1())
               .child(Button("prs-quiz-back", { label: "Back to the review", size: "sm", variant: done ? "default" : "ghost", onClick: (_e, cx) => ((this.view = null), cx.notify()) }))),
@@ -975,7 +1052,7 @@ export default class Prs {
               .child(Button("prs-open", { label: "Open PR", icon: "external", size: "sm", variant: "outline", onClick: (_e, cx) => cx.spawn(async () => hub.openUrl(p.url)) }))
               .child(Button("prs-files", { label: `Files changed${this.pfiles.files(p) ? ` · ${this.pfiles.files(p).length}` : ""}`, icon: "git-commit", size: "sm", variant: "outline", tooltip: "Every changed file as a diff or in full; click a line to comment on it", onClick: (_e, cx) => { this.view = "files"; this.pfiles.load(cx, p); this.drafts.load(cx, p).then((c) => c && cx.notify()); cx.notify(); } }))
               .child(Button("prs-explain", { label: "Explain", icon: "sparkles", size: "sm", variant: "outline", tooltip: "What this pull request does and how it differs from main, with a diagram, written by a gateway model", onClick: (_e, cx) => { this.view = "explain"; this.loadExplain(cx, p); cx.notify(); } }))
-              .child(Button("prs-quiz", { label: this.quizScore(p) ? `Quiz · ${this.quizScore(p).right}/${this.quizScore(p).total}` : "Quiz me", icon: "circle-help", size: "sm", variant: "outline", tooltip: "Questions on the change and on the agent's comments, before your name goes on the review", onClick: (_e, cx) => { this.view = "quiz"; this.loadQuiz(cx, p); cx.notify(); } }))
+              .child(Button("prs-quiz", { label: !this.quizScore(p) ? "Quiz me" : this.quizScore(p).answered < this.quizScore(p).total ? `Quiz · ${this.quizScore(p).answered}/${this.quizScore(p).total} answered` : `Quiz · ${this.quizScore(p).right}/${this.quizScore(p).total} right`, icon: "circle-help", size: "sm", variant: "outline", tooltip: "Questions on the change and on the agent's comments, before your name goes on the review", onClick: (_e, cx) => { this.view = "quiz"; this.loadQuiz(cx, p); cx.notify(); } }))
               .when(this.editors.length > 0, (e) => e.child(Button("prs-openin", { label: "Open in…", icon: "folder", size: "sm", variant: "outline", tooltip: "The pull request's worktree, in an editor", onClick: () => openMenu(this.editors.map(([id, , label]) => ({ label, icon: "code", command: `prs:openin:${id}:${keyOf(p)}` })), { width: 200 }) })))
               .child(Button("prs-worktree", { label: this.worktrees.has(keyOf(p)) ? "Open worktree" : "Explore in a worktree", icon: "git-branch", size: "sm", variant: "outline", tooltip: "A git worktree of this pull request's head in ~/worktrees, opened in a new tab; your own checkout is not touched", onClick: (_e, cx) => this.worktree(cx, p) }))
               .when(this.worktrees.has(keyOf(p)), (e) => e.child(Button("prs-worktree-rm", { label: "Remove worktree", size: "sm", variant: "ghost", onClick: (_e, cx) => this.worktree(cx, p, true) })))
@@ -1202,6 +1279,7 @@ export default class Prs {
             : sel && this.view === "quiz"
               ? v_flex()
                   .id("prs-quiz-scroll")
+                  .on_size_change((size, cx) => { if (Math.abs((this.width ?? 0) - size.width) > 8) { this.width = size.width; cx.notify(); } })
                   .flex_1()
                   .min_h(0)
                   .overflow_y_scrollbar()

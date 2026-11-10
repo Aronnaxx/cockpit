@@ -231,27 +231,44 @@ def explain_why(slug, number, index, model):
     text, _ = cockpit_gateway.ask(model, [{"role": "system", "content": system}, {"role": "user", "content": prompt}], max_tokens=6000)
     return {"text": text, "sources": [label for label, _ in sessions], "model": model}
 
+DIAGRAM = {"type": "object", "additionalProperties": False, "required": ["direction", "nodes", "edges"], "properties": {
+    "direction": {"enum": ["down", "right"]},
+    "nodes": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["id", "label", "kind"], "properties": {"id": {"type": "string"}, "label": {"type": "string"}, "kind": {"enum": ["box", "round", "decision"]}}}},
+    "edges": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["from", "to", "label"], "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "label": {"type": "string"}}}}}}
+
 QUIZ_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "required": ["questions"],
     "properties": {"questions": {"type": "array", "items": {"type": "object", "additionalProperties": False,
-        "required": ["about", "comment", "question", "choices", "answer", "explain"],
+        "required": ["about", "kind", "comment", "question", "code", "choices", "answer", "accepted", "explain", "diagram", "explain_diagram"],
         "properties": {
             "about": {"enum": ["behaviour", "design", "risk", "comment"]},
+            "kind": {"enum": ["choice", "blank"]},
             "comment": {"type": "integer"},
             "question": {"type": "string"},
+            "code": {"type": "object", "additionalProperties": False, "required": ["path", "start", "end"], "properties": {"path": {"type": "string"}, "start": {"type": "integer"}, "end": {"type": "integer"}}},
             "choices": {"type": "array", "items": {"type": "string"}},
             "answer": {"type": "integer"},
-            "explain": {"type": "string"}}}}},
+            "accepted": {"type": "array", "items": {"type": "string"}},
+            "explain": {"type": "string"},
+            "diagram": DIAGRAM,
+            "explain_diagram": DIAGRAM}}}},
 }
 
 QUIZ_SYSTEM = """You write a short quiz for an engineer who is about to put their name on a code review of a pull request, much of it drafted by an AI agent. The quiz checks that they understand the change themselves rather than passing on what the agent said. Ask about the code, never trivia (no "how many files", no names to memorise).
 
-Write exactly {count} questions, multiple choice, four choices each, one right:
+Write exactly {count} questions:
 - about half on the change itself ("behaviour": what happens now in a concrete case, before vs after; "design": why it is built this way or what it trades off; "risk": what could break and for whom). Use concrete inputs and situations from the code.
-- the rest on the draft's comments (none if it has none) ("comment", with "comment" set to the comment's index as given): does the comment's claim hold, what in the code makes it so, or what the right fix is. When a comment is wrong or overstated, the right answer says so. Do not leak the answer in the question. Refer to a comment by what it says ("the comment on the drive count says…"), never by its index or as "draft comment [n]": the index is only for the "comment" field.
-Refer to a comment by its file and line or by what it says ("the comment on line 77 of qRadioEnvironmentTest.sh"), never by its number in brackets: the person sees the comment's code beside the question, not those numbers. For other questions "comment" is -1. "answer" is the index (0-3) of the right choice; place it at varying positions. Make the wrong choices plausible to someone who only skimmed. "explain": two or three sentences on why the answer is right, pointing at the code (file and line)."""
+- the rest on the draft's comments (none if it has none) ("comment", with "comment" set to the comment's index as given; -1 for other questions): does the comment's claim hold, what in the code makes it so, or what the right fix is. When a comment is wrong or overstated, the right answer says so. The person sees the comment and its code beside the question, so refer to it by what it says or by its file and line ("the comment on the drive count", "line 77 of qRadioEnvironmentTest.sh"), never by its index or as "draft comment [n]".
+
+Two kinds:
+- "choice": four choices, one right; "answer" is its index (0-3); make the wrong ones plausible to someone who only skimmed. "accepted" is [].
+- "blank": a fill-in-the-blank, one or two of the quiz: the question holds exactly one "____" for a short answer that the code decides (a value, a flag, a function or variable name, an exit code, a count); "accepted" lists every spelling that counts as right (e.g. ["4", "four"], ["--quiet", "-q"]); "choices" is [] and "answer" is -1.
+
+"code": the lines the question is about, which the person is shown above it: the exact path from the diff and the first and last line in the new version (keep it under 30 lines; a question about specific lines must name them here). For a comment question, the comment's own lines.
+"explain": two or three sentences on why the answer is right, pointing at the code (file and line).
+"diagram" and "explain_diagram": a small flowchart (3 to 8 nodes, short labels) when a flow, a branch or an order makes the question or its explanation clearer: the question's sets up the situation without giving the answer away, the explanation's shows why. Most questions need none: give {"direction": "down", "nodes": [], "edges": []}."""
 
 
 LEVELS = {
@@ -298,16 +315,34 @@ def quiz(slug, number, model, missed=None):
     by = dict(comments)
     qs = []
     for q in d.get("questions") or []:
-        if len(q.get("choices") or []) < 2 or not 0 <= int(q.get("answer", -1)) < len(q["choices"]):
-            continue
-        # Models put the right answer in the same place: shuffled here, the answer moved with it.
-        order = list(range(len(q["choices"])))
-        random.shuffle(order)
-        q["answer"] = order.index(int(q["answer"]))
-        q["choices"] = [q["choices"][j] for j in order]
+        if q.get("kind") == "blank":
+            if "____" not in str(q.get("question", "")) or not [a for a in q.get("accepted") or [] if str(a).strip()]:
+                continue
+            q["choices"], q["answer"] = [], -1
+        else:
+            q["kind"] = "choice"
+            if len(q.get("choices") or []) < 2 or not 0 <= int(q.get("answer", -1)) < len(q["choices"]):
+                continue
+            # Models put the right answer in the same place: shuffled here, the answer moved with it.
+            order = list(range(len(q["choices"])))
+            random.shuffle(order)
+            q["answer"] = order.index(int(q["answer"]))
+            q["choices"] = [q["choices"][j] for j in order]
         c = by.get(int(q.get("comment", -1)))
         if q.get("about") == "comment" and c:
-            q["path"], q["line"], q["start_line"] = c["path"], c.get("line"), c.get("start_line")
+            # The comment itself goes with its question: the person reads what the agent said, and its lines.
+            q["path"], q["line"], q["start_line"], q["comment_body"] = c["path"], c.get("line"), c.get("start_line"), c.get("body")
+            if not (q.get("code") or {}).get("path"):
+                q["code"] = {"path": c["path"], "start": c.get("start_line") or c.get("line"), "end": c.get("line")}
+        code = q.get("code") or {}
+        if not code.get("path") or not code.get("start"):
+            q["code"] = None
+        else:
+            lo, hi = sorted((int(code["start"]), int(code.get("end") or code["start"])))
+            q["code"] = {"path": code["path"], "start": lo, "end": min(hi, lo + 40)}
+        for key in ("diagram", "explain_diagram"):
+            if not (q.get(key) or {}).get("nodes"):
+                q[key] = None
         qs.append(q)
     # The questions in no set order either: on the change and on the comments mixed.
     random.shuffle(qs)
