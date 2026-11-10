@@ -12,7 +12,7 @@ export function loadPrs({ force = false } = {}) {
   running = (async () => {
     try {
       const { home } = await hub.install();
-      const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/bin/cockpit-prs.py`, ...(force ? ["--force"] : [])], { timeout: 90000 });
+      const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-prs.py`, ...(force ? ["--force"] : [])], { timeout: 90000 });
       const d = JSON.parse(r.stdout || "null");
       if (d) {
         setShared("cockpit.prs", d);
@@ -20,6 +20,12 @@ export function loadPrs({ force = false } = {}) {
         const reviews = (d.assigned ?? []).filter((p) => p.turn?.who === "you").length;
         const n = mine + reviews;
         setShared("badge.prs", { count: n, tone: "warning" });
+        // A pull request no longer on you (a review submitted, a PR merged or closed): the hub's inbox is asked to look again,
+        // so its count follows without waiting for its own next pass.
+        const on = [...(d.mine ?? []), ...(d.assigned ?? [])].filter((p) => p.turn?.who === "you").map((p) => `${p.repo}#${p.number}`);
+        const before = globalThis.cockpitPrsOnYou;
+        globalThis.cockpitPrsOnYou = on;
+        if (before && before.some((x) => !on.includes(x))) hub.request("act", { app: "inbox", action: "request_refresh", args: [] }).catch(() => {});
       }
       return d;
     } catch {
