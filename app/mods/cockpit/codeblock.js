@@ -135,7 +135,7 @@ export function CodeRows(id, rows, path) {
           .items_center()
           .bg(r.mark ? alpha(r.mark, 0.18) : alpha(k.muted, 0))
           .child(div().w(38).flex_none().flex().justify_end().text_size(10.5).font_family("JetBrains Mono").text_color(r.mark ? k.foreground : k.dim).child(r.num == null ? "" : String(r.num)))
-          .child(h_flex().whitespace_nowrap().text_size(11).font_family("JetBrains Mono").text_color(k.foreground).children(spans(r.text || " ", ext, c).map((s, j) => div().id(`${id}-${i}-${j}`).whitespace_pre().text_color(s.color ?? k.foreground).child(s.text)))),
+          .child(h_flex().whitespace_nowrap().text_size(11).font_family("JetBrains Mono").text_color(k.foreground).children(spans(r.text || " ", ext, c).map((s, j) => div().id(`${id}-${i}-${j}`).whitespace_nowrap().text_color(s.color ?? k.foreground).child(s.text)))),
       ),
     );
 }
