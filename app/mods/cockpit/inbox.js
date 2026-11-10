@@ -9,6 +9,8 @@ import { h_flex, v_flex, InputState } from "gpui-base";
 import { settings } from "herdr";
 import * as hub from "./hub.js";
 import { prs as cockpitPrs } from "./prsdata.js";
+import { LAUNCH_AGENTS, lastAgent, reviewPr, agentModel } from "./agentlaunch.js";
+import { ModelPicker } from "./modelpick.js";
 import {
   tokens, TEXT, RADIUS, Icon, Spinner, Badge, Button, Kbd, PageHeader, SearchField, TextField, KeyHints, Empty, ErrorState,
   Skeleton, Command, Toaster, Flashes, Scroller, Hover, HoverCard, openMenu, alpha, Chip, Mono, ToneButton, Pills,
@@ -89,6 +91,9 @@ export default class Inbox {
     this.pending = new Map();
     this.outcomes = new Map();
     this.dialog = null;
+    // "Review with…": the agent and the gateway model a review runs on; the eye button repeats the last pick.
+    this.reviewModel = new ModelPicker(cx, { placeholder: "The gateway's models (empty: the agent's own)", store: "cockpit.review.model" });
+    this.reviewAgent = lastAgent();
     this.palette = null;
     this.shown = true;
     this.looked = null;
@@ -130,7 +135,7 @@ export default class Inbox {
     this.sub?.stop();
     this.sub = hub.subscribe(
       cx,
-      { views: [{ name: "inbox", args: { group: this.group } }, { name: "agents", args: {} }], focus: "inbox" },
+      { views: [{ name: "inbox", args: { group: this.group } }, { name: "agents", args: {} }] },
       (m, cx) => {
         if (m.view === "inbox") this.take(m.value, cx);
         if (m.view === "agents") this.agents = m.value;
@@ -366,10 +371,39 @@ export default class Inbox {
     }
   }
 
+  /** The pull request a review row is about, as the PRs page has it (its branch, its role, whose turn). */
+  prOf(row) {
+    const it = row?.item;
+    if (!it?.number || (row.kind !== "review" && row.kind !== "pr")) return null;
+    const d = cockpitPrs();
+    const name = String(it.repo ?? "").split("/").pop();
+    return [...(d?.mine ?? []), ...(d?.assigned ?? [])].find((p) => p.repo.split("/")[1] === name && p.number === Number(it.number)) ?? null;
+  }
+
+  /** A review the cockpit's way (agentlaunch.js reviewPr): in the PR's worktree, writing the review draft, in a "review <repo>#<n>" tab. */
+  review(cx, p, agent = this.reviewAgent, model = this.reviewModel.value()) {
+    cx.spawn(async (cx) => {
+      const name = LAUNCH_AGENTS.find((a) => a.id === agent)?.label ?? agent;
+      this.toasts.push(cx, `${name}${model ? ` on ${model}` : ""}: making the worktree for ${p.repo.split("/")[1]}#${p.number}…`, { kind: "info" });
+      const ok = await reviewPr(p, { agent, model: agentModel(agent, model) });
+      if (ok) this.toasts.push(cx, `${name} is reviewing ${p.repo.split("/")[1]}#${p.number} on ${p.branch}. Its draft shows on the PR page.`, { kind: "success" });
+      cx.notify();
+    });
+  }
+
+  openReviewWith(cx, row) {
+    const p = this.prOf(row);
+    if (!p) return this.toasts.push(cx, "The PRs page has not read this pull request yet", { kind: "error" });
+    this.dialog = { kind: "reviewWith", row, p };
+    cx.notify();
+  }
+
   /** A row's action: a choice asks which (the merge menu asks GitHub), a change asks first, the rest runs at once. */
   run(cx, row, act) {
     if (!act) return;
     if (act.call?.fn === "start") return this.openStart(cx, row, act);
+    // The hub's review starts the agent in your own checkout with its own prompt: no worktree, no draft. Ours does both.
+    if (act.label === "review" && this.prOf(row)) return this.review(cx, this.prOf(row));
     if (act.label === "merge" && (row.kind === "pr" || row.kind === "review")) return this.openMerge(cx, row);
     if (act.choices?.length) {
       this.dialog = { kind: "pick", title: `${act.label[0].toUpperCase()}${act.label.slice(1)}`, description: row.name, choices: act.choices.map((c) => ({ label: c.label, run: (cx) => this.call(cx, c.call, { row }) })) };
@@ -517,6 +551,7 @@ export default class Inbox {
     if (!row) return;
     this.sel = row.path;
     const items = row.acts.map((a, i) => ({ label: a.label[0].toUpperCase() + a.label.slice(1), kbd: a.key, icon: ICON[a.label] ?? ICON[a.call?.fn], destructive: /remove|stop/.test(a.label), command: `inbox:act:${i}` }));
+    if (row.acts.some((a) => a.label === "review") && this.prOf(row)) items.push({ label: "Review with…", icon: "bot", command: "inbox:reviewwith" });
     if (row.kind !== "plain") items.push("separator", { label: this.picked.has(row.key) ? "Unpick" : "Pick", kbd: "v", command: "inbox:pick" }, { label: `Pick all ${KIND_NAME[row.kind]?.[1] ?? "alike"}`, kbd: "V", command: "inbox:alike" });
     if (row.children?.length) items.push({ label: this.isOpen(row) ? "Fold" : "Unfold", kbd: "space", command: "inbox:fold" });
     openMenu(items);
@@ -537,6 +572,7 @@ export default class Inbox {
       const row = this.current();
       if (action === "act" && row) this.run(cx, row, row.acts[Number(rest[0])]);
       else if (action === "pick") this.pick(row);
+      else if (action === "reviewwith" && row) this.openReviewWith(cx, row);
       else if (action === "alike") this.pickAlike(row);
       else if (action === "fold") this.toggleFold(row);
       else if (action === "state") {
@@ -813,7 +849,7 @@ export default class Inbox {
     if (!r) return null;
     // Changes were asked but the reviewers were asked again: it waits on them, not on you.
     const mine = [...(cockpitPrs()?.mine ?? [])].find((p) => p.url === row.key);
-    if (mine?.turn?.why === "re-requested" && r.state === "blocked") return Chip(`Re-review requested: ${mine.reviewers.filter((x) => x.re_requested).map((x) => x.login).join(", ")}`, { color: this.tone("info", k) ?? k.info, icon: "hourglass" });
+    if (mine?.turn?.why === "re-requested" && r.state === "blocked") return Chip(`Re-review requested: ${mine.reviewers.filter((x) => x.re_requested).map((x) => x.login).join(", ")}`, { color: k.info, icon: "hourglass" });
     const icon = { ready: "git-merge", blocked: "circle-x", waiting: "hourglass", draft: "git-pull-request-draft", queued: "layers", merged: "git-merge" }[r.state] ?? "circle";
     return Chip(r.text.replace(/ · you can't merge.*$/, ""), { color: this.tone(r.tone, k) ?? k.mutedFg, icon });
   }
@@ -825,7 +861,10 @@ export default class Inbox {
   }
 
   rowActions(row, k, cx) {
-    return row.acts.slice(0, 3).map((a, i) =>
+    const withBtn = row.acts.some((a) => a.label === "review") && this.prOf(row)
+      ? [Button(`ra-${row.path}-with`, { icon: "bot", variant: "ghost", size: "icon-sm", tooltip: "Review with… (pick the agent and the model)", onClick: (_e, cx) => { cx.stop_propagation(); this.select(row); this.openReviewWith(cx, row); } })]
+      : [];
+    return withBtn.concat(row.acts.slice(0, 3).map((a, i) =>
       Button(`ra-${row.path}-${i}`, {
         icon: ICON[a.label] ?? ICON[a.call?.fn] ?? "chevron-right",
         variant: "ghost",
@@ -837,7 +876,7 @@ export default class Inbox {
           this.run(cx, row, a);
         },
       }),
-    );
+    ));
   }
 
   /** A PR's hover card: GitHub's facts, fetched when the pointer rests on the row. */
@@ -1263,6 +1302,16 @@ export default class Inbox {
             .children((p.blockers ?? []).map((b) => h_flex().gap(8).items_start().child(Icon("circle-x", { size: 14, color: k.destructive })).child(div().flex_1().text_size(TEXT.sm).text_color(k.destructive).child(b))))
             .children((p.steps ?? []).map((s, i) => h_flex().gap(8).items_start().child(h_flex().size(18).flex_none().rounded(9).bg(k.muted).text_size(TEXT.xs).text_color(k.mutedFg).items_center().justify_center().child(String(i + 1))).child(div().flex_1().text_size(TEXT.sm).child(s))));
       actions.push(Button("dlg-start", { label: p?.ok ? "Start" : "Can't start", icon: "play", kbd: "⏎", disabled: !p?.ok, onClick: (_e, cx) => p?.ok && this.startNow(cx) }));
+    } else if (d.kind === "reviewWith") {
+      title = `Review ${d.p.repo.split("/")[1]}#${d.p.number} with…`;
+      description = `${d.p.title} · on ${d.p.branch}, in its own worktree; the agent writes a review draft, nothing is posted`;
+      body = v_flex()
+        .gap(10)
+        .child(div().text_size(TEXT.xs).text_color(k.mutedFg).child("Agent"))
+        .child(h_flex().gap(6).flex_wrap().children(LAUNCH_AGENTS.map((a) => Button(`rw-agent-${a.id}`, { label: a.label, size: "sm", variant: this.reviewAgent === a.id ? "default" : "outline", onClick: (_e, cx) => ((this.reviewAgent = a.id), cx.notify()) }))))
+        .child(div().text_size(TEXT.xs).text_color(k.mutedFg).child("Model"))
+        .child(this.reviewModel.element(k, "review-with"));
+      actions.push(Button("dlg-review", { label: "Start the review", icon: "play", onClick: (_e, cx) => { const p = d.p; this.closeDialog(cx); this.review(cx, p); } }));
     } else if (d.kind === "file") {
       title = "File an issue";
       description = "A new issue, assigned to you";

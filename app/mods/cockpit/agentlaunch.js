@@ -3,6 +3,7 @@
 
 import { exec, run, notify, spaces } from "herdr";
 import * as hub from "./hub.js";
+import { prsConfig } from "./prsdata.js";
 
 /** The agents a person can pick for a pull request's work. */
 export const LAUNCH_AGENTS = [
@@ -66,6 +67,22 @@ export async function launchAgent({ agent, prompt, folder, name, model = null, r
   }
   openInSpace(repoName ?? name.split(" ").pop().split("#")[0], { name, folder: folder?.replace(/^~/, home), argv: ["sh", "-lc", line] });
   return true;
+}
+
+/** A gateway model as the agent names it: OpenCode reaches the gateway as its provider `litellm`, so litellm/<id>. */
+export function agentModel(agent, model) {
+  const m = String(model ?? "").trim();
+  if (!m) return null;
+  return agent === "opencode" && !m.startsWith("litellm/") ? `litellm/${m}` : m;
+}
+
+/** A review of a pull request, from wherever it is asked (the PR page, the inbox): in the PR's worktree on its branch, with the
+ *  prompt that has the agent write the review draft (never post), in a tab named "review <repo>#<n>" so the PR page, Home and the
+ *  Comments panel follow it. A re-review when you were asked again; replies to the threads on your own PR. */
+export async function reviewPr(p, { agent = lastAgent(), model = null } = {}) {
+  const cfg = await prsConfig();
+  const kind = p.role === "author" ? "fix" : p.turn?.why === "re-review" || p.turn?.why === "re-requested" ? "rereview" : "review";
+  return launchAgent({ agent, model, prompt: prPrompt(kind, p), folder: await prWorktree(p, cfg), name: `${kind} ${p.repo.split("/")[1]}#${p.number}` });
 }
 
 /** Where a repository's checkout is: `prs.repos` in the cockpit config ({"owner/name": "~/path"}), else ~/<name>. */
