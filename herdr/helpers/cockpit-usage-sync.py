@@ -16,6 +16,7 @@ keeps the last answer. With no answer at all, the window is an estimate: transcr
 Writes ~/.cache/cockpit/agent-usage.json and ~/.cache/cockpit/limits.json.
 """
 
+import re
 import glob
 import json
 import os
@@ -346,6 +347,41 @@ def context_codex():
     return None
 
 
+def claude_window(model, used, session=None):
+    """Claude Code's context window, as Claude Code itself reports it to the status line: the session's own
+    (~/.cache/cockpit/claude-sessions/<session>.json, written by a Claude Code status line that saves each session's context_window), else the last one reported for
+    the model (claude-windows.json). Only a session that never drew a status line (a headless run) falls back to a rule: 1M for
+    a [1m] model, the Claude 5 families and any session past 200K, else 200K."""
+    m = str(model or "")
+    if session:
+        try:
+            own = json.load(open(os.path.expanduser(f"~/.cache/cockpit/claude-sessions/{session}.json")))
+            if own.get("window"):
+                return int(own["window"])
+        except Exception:
+            pass
+    path = os.path.expanduser("~/.cache/cockpit/claude-windows.json")
+    try:
+        seen = json.load(open(path))
+    except Exception:
+        seen = {}
+    try:
+        d = json.load(open(os.path.expanduser("~/.cache/cockpit/usage-claude.json")))
+        mid, size = (d.get("model") or {}).get("id"), (d.get("context_window") or {}).get("context_window_size")
+        if mid and size and seen.get(mid) != size:
+            seen[mid] = size
+            with open(path + ".tmp", "w") as f:
+                json.dump(seen, f)
+            os.replace(path + ".tmp", path)
+    except Exception:
+        pass
+    if seen.get(m):
+        return int(seen[m])
+    if (used or 0) > 200_000 or "1m" in m.lower() or re.search(r"claude-(opus|sonnet|fable|mythos)-([5-9]|\d\d)", m):
+        return 1_000_000
+    return 200_000
+
+
 def context_claude():
     d = load_json(os.path.join(CACHE, "usage-claude.json"), {}) or {}
     cw = d.get("context_window") or {}
@@ -360,7 +396,7 @@ def context_claude():
             u = json.loads(line).get("message", {}).get("usage")
             if u:
                 used = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("output_tokens", 0)
-                win = 1_000_000 if used > 200_000 else 200_000
+                win = claude_window(json.loads(line).get("message", {}).get("model"), used)
                 return {"percent": min(100.0, round(used * 100.0 / win, 1)), "used": used, "window": win, "at": int(os.path.getmtime(files[-1]) * 1000)}
         except Exception:
             continue

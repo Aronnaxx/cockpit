@@ -3,11 +3,11 @@
 // the review draft; the draft's comments for the file sit under it, editable. Nothing is posted from here.
 
 import { div } from "gpui-kit";
-import { h_flex, v_flex } from "gpui-base";
+import { h_flex, v_flex, Scrollbar } from "gpui-base";
 import { exec, notify } from "herdr";
 import * as hub from "./hub.js";
 import { tokens, alpha, TEXT, RADIUS, Badge, Button, Empty, Mono, Spinner, Tabs } from "./ui.js";
-import { CodeBlock, DiffBlock, makeCode, LINE } from "./codeblock.js";
+import { CodeRows, FileRows } from "./codeblock.js";
 import { openFileAt, githubFileUrl } from "./editors.js";
 import { parseRange } from "./prreview.js";
 import { repoFolder } from "./agentlaunch.js";
@@ -41,8 +41,9 @@ export class PrFiles {
     this.sel = new Map(); // key -> path
     this.mode = "diff";
     this.trees = new Map(); // key -> worktree path
-    this.built = new Map(); // key:path -> [{hunk, code}]
-    this.full = new Map(); // key:path -> {code, lines} | "loading" | null
+    this.built = new Map(); // key:path -> hunks
+    this.full = new Map(); // key:path -> {lines} | "loading" | null
+    this.anchor = null; // the comment a shift-click on a line stretches: {path, line, row}
   }
 
   files(p) {
@@ -60,7 +61,7 @@ export class PrFiles {
         const d = JSON.parse(r.stdout || "{}");
         for (const f of d.files ?? []) {
           const hunks = parsePatch(f.patch);
-          this.built.set(`${keyOf(p)}:${f.path}`, hunks.map((h) => ({ hunk: h, code: makeCode(h.rows.map((x) => x.text), f.path) })));
+          this.built.set(`${keyOf(p)}:${f.path}`, hunks);
         }
         this.data.set(keyOf(p), d);
         if (!this.sel.get(keyOf(p)) && d.files?.length) this.sel.set(keyOf(p), d.files[0].path);
@@ -81,7 +82,7 @@ export class PrFiles {
         const { home } = await hub.install();
         const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-pr-file.py`, p.repo, String(p.number), path], { timeout: 90000 });
         const lines = JSON.parse(r.stdout || "{}").files?.[path];
-        this.full.set(key, lines ? { code: makeCode(lines, path), lines: lines.length } : null);
+        this.full.set(key, lines ? { lines } : null);
       } catch {
         this.full.set(key, null);
       }
@@ -130,7 +131,13 @@ export class PrFiles {
     cx.notify();
   }
 
-  /** The page. `drafts` is the review draft (comments added here go into it). */
+  /** A column that scrolls on its own and fills what it is given (overflow_y_scrollbar would wrap it and lose the bound). */
+  scroll(id, content) {
+    return div().flex_1().min_h(0).relative().child(v_flex().id(id).absolute().inset_0().overflow_y_scroll().child(content)).child(Scrollbar.vertical(id).absolute().inset_0());
+  }
+
+  /** The page, filling its parent: the files on the left and the file on the right, each scrolling on its own. `drafts` is the
+   * review draft (comments added here go into it). */
   render(k, p, drafts, cfg = {}) {
     const d = this.data.get(keyOf(p));
     if (!d || d === "loading") return h_flex().h(160).justify_center().items_center().gap(8).text_color(k.mutedFg).child(Spinner({ size: 14 })).child("Reading the changed files…");
@@ -139,15 +146,24 @@ export class PrFiles {
     const path = this.sel.get(keyOf(p)) ?? files[0]?.path;
     const file = files.find((f) => f.path === path);
     const pending = (pth) => (drafts.m.get(keyOf(p))?.rows ?? []).filter((r) => !r.reply_to && r.path.value().trim() === pth);
-    const addAt = (pth) => (line, cx) => {
+    // A click starts a comment on the line; a shift-click stretches the last one started here to a range, as on GitHub.
+    const addAt = (pth) => (line, ev, cx) => {
+      const e = drafts.m.get(keyOf(p));
+      const a = this.anchor;
+      if (ev?.modifiers?.shift && a?.path === pth && e?.rows.includes(a.row)) {
+        a.row.line.set_value(a.line === line ? String(line) : `${Math.min(a.line, line)}-${Math.max(a.line, line)}`);
+        drafts.queueSave(cx, e);
+        return cx.notify();
+      }
       drafts.addComment(cx, p, { path: pth, line });
-      notify({ title: "Comment started", body: `${pth}:${line} · it is in your review draft` });
+      this.anchor = { path: pth, line, row: drafts.m.get(keyOf(p))?.rows.at(-1) };
+      notify({ title: "Comment started", body: `${pth}:${line} · shift-click another line for a range · it is in your review draft` });
     };
+    const marks = new Map();
+    if (file) for (const r of pending(file.path)) { const g = parseRange(r.line.value()); if (g) for (let i = g.start; i <= g.end; i++) marks.set(i, k.warning); }
     const list = v_flex()
-      .id("pf-list")
-      .w(320)
-      .flex_none()
       .gap(2)
+      .pr(10)
       .children(
         files.map((f) => {
           const on = f.path === path;
@@ -176,36 +192,61 @@ export class PrFiles {
             );
         }),
       );
+    const mine = file ? pending(file.path) : [];
+    const comments = mine.length
+      ? [
+          div().pt(6).text_size(TEXT.sm).font_semibold().child(`Your comments on this file · ${mine.length}`),
+          ...mine.map((r) =>
+            v_flex().id(`pf-c-${r.id}`).gap(6).p(10).rounded(RADIUS.md).border_1().border_color(alpha(k.warning, 0.5)).bg(k.card)
+              .child(h_flex().gap(8).items_center().child(Mono(`line ${r.line.value() || "?"}`, { size: TEXT.xs, color: k.foreground })).child(div().flex_1()).child(Button(`pf-vs-${r.id}`, { label: "VS Code", size: "sm", variant: "ghost", onClick: (_e, cx) => this.inEditor(cx, p, cfg, file.path, parseRange(r.line.value())?.start ?? 1) })).child(Button(`pf-gh-${r.id}`, { label: "GitHub", size: "sm", variant: "ghost", onClick: (_e, cx) => this.onGithub(cx, p, file.path, parseRange(r.line.value())?.end ?? null) })).child(Button(`pf-rm-${r.id}`, { label: "Remove", size: "sm", variant: "ghost", onClick: (_e, cx) => drafts.removeRow(cx, p, r) })))
+              .child(drafts.box(k, r.body)),
+          ),
+        ]
+      : [];
     let body;
-    if (!file) body = Empty({ icon: "git-commit", title: "No files", description: "This pull request changes none." });
+    if (!file) body = this.scroll("pf-body", Empty({ icon: "git-commit", title: "No files", description: "This pull request changes none." }));
     else if (this.mode === "full") {
       const fl = this.full.get(`${keyOf(p)}:${file.path}`);
       if (!fl || fl === "loading") body = h_flex().h(120).justify_center().items_center().gap(8).text_color(k.mutedFg).child(Spinner({ size: 14 })).child("Reading the file…");
       else {
         const changed = new Set();
         for (const h of parsePatch(file.patch)) for (const r of h.rows) if (r.t === "+") changed.add(r.new);
-        const rows = Array.from({ length: fl.lines }, (_, i) => ({ t: changed.has(i + 1) ? "+" : " ", old: null, new: i + 1 }));
-        body = DiffBlock(`pf-full-${file.path}`, fl.code, rows, { onLine: addAt(file.path), marked: new Set(pending(file.path).flatMap((r) => { const g = parseRange(r.line.value()); return g ? Array.from({ length: g.end - g.start + 1 }, (_, i) => g.start + i) : []; })) });
+        // The file draws only the lines on screen and scrolls itself; your comments sit under it.
+        body = v_flex().flex_1().min_h(0).gap(8)
+          .child(div().flex_1().min_h(120).relative().rounded(6).bg(alpha(k.muted, 0.7)).overflow_hidden().child(FileRows(`pf-full-${file.path}`, fl.lines, file.path, { changed, marks, onLine: (n, cx) => addAt(file.path)(n, null, cx) }).size_full()).child(Scrollbar.vertical(`pf-full-${file.path}`).viewport_from_layout().absolute().inset_0()))
+          .when(mine.length > 0, (e) => e.child(div().flex_none().max_h(260).relative().child(v_flex().id("pf-full-c").max_h(260).overflow_y_scroll().gap(8).children(comments)).child(Scrollbar.vertical("pf-full-c").absolute().inset_0())));
       }
     } else {
-      const built = this.built.get(`${keyOf(p)}:${file.path}`) ?? [];
-      body = built.length
-        ? v_flex().gap(8).children(built.flatMap(({ hunk, code }, i) => [h_flex().id(`pf-h-${i}`).gap(8).items_center().px(8).py(2).rounded(RADIUS.sm).bg(alpha(k.info, 0.1)).child(div().flex_1().min_w(0).truncate().text_size(TEXT.xs).font_family("JetBrains Mono").text_color(k.info).child(hunk.header)).child(Button(`pf-hv-${i}`, { label: "VS Code", size: "sm", variant: "ghost", tooltip: "This hunk in VS Code, in the PR's worktree", onClick: (_e, cx) => this.inEditor(cx, p, cfg, file.path, hunk.rows.find((r) => r.new)?.new ?? 1) })).child(Button(`pf-hg-${i}`, { label: "GitHub", size: "sm", variant: "ghost", tooltip: "This hunk on GitHub", onClick: (_e, cx) => this.onGithub(cx, p, file.path, hunk.rows.find((r) => r.new)?.new ?? null) })), DiffBlock(`pf-d-${file.path}-${i}`, code, hunk.rows, { onLine: addAt(file.path), marked: new Set(pending(file.path).flatMap((r) => { const g = parseRange(r.line.value()); return g ? Array.from({ length: g.end - g.start + 1 }, (_, i) => g.start + i) : []; })) })]))
-        : div().text_size(TEXT.sm).text_color(k.dim).child(`${file.status === "renamed" ? "Renamed" : "No text diff"} (a binary file, or one too large to show here). Use “Full file”.`);
+      const hunks = this.built.get(`${keyOf(p)}:${file.path}`) ?? [];
+      body = this.scroll(
+        "pf-body",
+        v_flex().gap(8).pr(10).pb(16)
+          .children(
+            hunks.length
+              ? hunks.flatMap((hunk, i) => [
+                  h_flex().id(`pf-h-${i}`).gap(8).items_center().px(8).py(2).rounded(RADIUS.sm).bg(alpha(k.info, 0.1)).child(div().flex_1().min_w(0).truncate().text_size(TEXT.xs).font_family("JetBrains Mono").text_color(k.info).child(hunk.header)).child(Button(`pf-hv-${i}`, { label: "VS Code", size: "sm", variant: "ghost", tooltip: "This hunk in VS Code, in the PR's worktree", onClick: (_e, cx) => this.inEditor(cx, p, cfg, file.path, hunk.rows.find((r) => r.new)?.new ?? 1) })).child(Button(`pf-hg-${i}`, { label: "GitHub", size: "sm", variant: "ghost", tooltip: "This hunk on GitHub", onClick: (_e, cx) => this.onGithub(cx, p, file.path, hunk.rows.find((r) => r.new)?.new ?? null) })),
+                  CodeRows(`pf-d-${file.path}-${i}`, hunk.rows.map((r) => ({ num: r.new, old: r.old, t: r.t, text: r.text, mark: r.new != null ? marks.get(r.new) : null })), file.path, { onLine: addAt(file.path), marked: new Set(marks.keys()) }),
+                ])
+              : [div().text_size(TEXT.sm).text_color(k.dim).child(`${file.status === "renamed" ? "Renamed" : "No text diff"} (a binary file, or one too large to show here). Use “Full file”.`)],
+          )
+          .children(comments),
+      );
     }
-    const mine = file ? pending(file.path) : [];
     return h_flex()
+      .flex_1()
+      .min_h(0)
       .gap(16)
-      .items_start()
-      .child(list)
+      .child(v_flex().w(320).flex_none().h_full().child(this.scroll("pf-list", list)))
       .child(
         v_flex()
           .id("pf-view")
           .flex_1()
           .min_w(0)
+          .h_full()
           .gap(10)
           .child(
             h_flex()
+              .flex_none()
               .gap(10)
               .items_center()
               .child(Mono(file?.path ?? "", { size: TEXT.sm, color: k.foreground }))
@@ -213,9 +254,8 @@ export class PrFiles {
               .children(file ? [Button("pf-vscode", { label: "VS Code", icon: "code", size: "sm", variant: "outline", tooltip: "This file in VS Code, in the PR's worktree", onClick: (_e, cx) => this.inEditor(cx, p, cfg, file.path, 1) }), Button("pf-github", { label: "GitHub", icon: "external", size: "sm", variant: "outline", tooltip: "This file in the PR's Files changed on GitHub", onClick: (_e, cx) => this.onGithub(cx, p, file.path) })] : [])
               .child(Tabs("pf-mode", { value: this.mode, onChange: (v, cx) => this.setMode(cx, p, v), items: [{ value: "diff", label: "Diff" }, { value: "full", label: "Full file" }] })),
           )
-          .child(div().text_size(TEXT.xs).text_color(k.dim).child("Click a line's number to comment on it. Comments go into your review draft; nothing is posted until you post it."))
-          .child(body)
-          .children(mine.length ? [div().text_size(TEXT.sm).font_semibold().child(`Your comments on this file · ${mine.length}`), ...mine.map((r) => v_flex().id(`pf-c-${r.id}`).gap(6).p(10).rounded(RADIUS.md).border_1().border_color(alpha(k.warning, 0.5)).bg(k.card).child(h_flex().gap(8).items_center().child(Mono(`line ${r.line.value() || "?"}`, { size: TEXT.xs, color: k.foreground })).child(div().flex_1()).child(Button(`pf-vs-${r.id}`, { label: "VS Code", size: "sm", variant: "ghost", onClick: (_e, cx) => this.inEditor(cx, p, cfg, file.path, (parseRange(r.line.value())?.start ?? 1)) })).child(Button(`pf-gh-${r.id}`, { label: "GitHub", size: "sm", variant: "ghost", onClick: (_e, cx) => this.onGithub(cx, p, file.path, (parseRange(r.line.value())?.end ?? null)) })).child(Button(`pf-rm-${r.id}`, { label: "Remove", size: "sm", variant: "ghost", onClick: (_e, cx) => drafts.removeRow(cx, p, r) }))).child(drafts.box(k, r.body)))] : []),
+          .child(div().flex_none().text_size(TEXT.xs).text_color(k.dim).child("Click a line's number to comment on it; shift-click another to make it a range. Comments go into your review draft; nothing is posted until you post it."))
+          .child(body),
       );
   }
 }

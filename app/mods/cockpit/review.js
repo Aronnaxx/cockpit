@@ -5,7 +5,7 @@
 
 import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState } from "gpui-base";
-import { focused, panes, agents, layout, props, shared, setShared } from "herdr";
+import { exec, focused, panes, agents, layout, props, shared, setShared } from "herdr";
 import * as hub from "./hub.js";
 import { ModelPicker } from "./modelpick.js";
 import { openCode } from "./code.js";
@@ -201,11 +201,20 @@ export default class Review {
     this.diff.only = new Set(steps[this.step].hunks ?? []);
   }
 
+  /** The hub only runs Claude's haiku, sonnet or opus: it makes the job, then bin/cockpit-walkthrough.py answers it with the
+   * gateway model picked here (same prompt, schema and cache; the hub's Stop stops it). */
   generate(cx) {
+    const model = this.picker.value();
+    const repo = this.repo, scope = this.scope;
     cx.spawn(async (cx) => {
-      const r = await hub.act("review", "walkthrough", [this.repo, this.scope, this.picker.value()]).catch((e) => ({ error: String(e?.message ?? e) }));
+      const r = await hub.act("review", "walkthrough", [repo, scope, "haiku"]).catch((e) => ({ error: String(e?.message ?? e) }));
       if (r.error) this.toasts.push(cx, r.error, { kind: "error" });
-      else this.toasts.push(cx, r.note || "Writing the walkthrough", { kind: "info" });
+      else {
+        const { home } = await hub.install();
+        const q = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+        await exec("sh", ["-c", `nohup python3 ${q(`${home}/.local/share/cockpit/herdr/helpers/cockpit-walkthrough.py`)} ${q(repo)} ${q(scope)} ${q(model)} >/tmp/cockpit-walkthrough.log 2>&1 &`]).catch(() => {});
+        this.toasts.push(cx, `Writing the walkthrough with ${model}`, { kind: "info" });
+      }
       this.next = 0;
       this.load(cx);
     });

@@ -336,6 +336,41 @@ def window_of(model):
     return (cache.get("limits") or {}).get(model)
 
 
+def claude_window(model, used, session=None):
+    """Claude Code's context window, as Claude Code itself reports it to the status line: the session's own
+    (~/.cache/cockpit/claude-sessions/<session>.json, written by a Claude Code status line that saves each session's context_window), else the last one reported for
+    the model (claude-windows.json). Only a session that never drew a status line (a headless run) falls back to a rule: 1M for
+    a [1m] model, the Claude 5 families and any session past 200K, else 200K."""
+    m = str(model or "")
+    if session:
+        try:
+            own = json.load(open(os.path.expanduser(f"~/.cache/cockpit/claude-sessions/{session}.json")))
+            if own.get("window"):
+                return int(own["window"])
+        except Exception:
+            pass
+    path = os.path.expanduser("~/.cache/cockpit/claude-windows.json")
+    try:
+        seen = json.load(open(path))
+    except Exception:
+        seen = {}
+    try:
+        d = json.load(open(os.path.expanduser("~/.cache/cockpit/usage-claude.json")))
+        mid, size = (d.get("model") or {}).get("id"), (d.get("context_window") or {}).get("context_window_size")
+        if mid and size and seen.get(mid) != size:
+            seen[mid] = size
+            with open(path + ".tmp", "w") as f:
+                json.dump(seen, f)
+            os.replace(path + ".tmp", path)
+    except Exception:
+        pass
+    if seen.get(m):
+        return int(seen[m])
+    if (used or 0) > 200_000 or "1m" in m.lower() or re.search(r"claude-(opus|sonnet|fable|mythos)-([5-9]|\d\d)", m):
+        return 1_000_000
+    return 200_000
+
+
 def ctx(used, window):
     return {"used": used, "window": window, "percent": round(used * 100.0 / window, 1) if window else None} if used else None
 
@@ -372,7 +407,7 @@ def info_claude(session):
                 u = m.get("usage") or {}
                 used = (u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0) + (u.get("output_tokens") or 0)
                 if used and m.get("model"):
-                    out = {"model": m["model"], "context": ctx(used, 1_000_000 if used > 200_000 or "1m" in m["model"] else 200_000)}
+                    out = {"model": m["model"], "context": ctx(used, claude_window(m["model"], used, session))}
                     break
             except Exception:
                 continue

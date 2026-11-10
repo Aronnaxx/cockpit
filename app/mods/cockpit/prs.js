@@ -5,15 +5,17 @@
 
 import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState, TextView } from "gpui-base";
-import { exec, notify, run, shared, setShared } from "herdr";
+import { exec, notify, run, shared, setShared, agents, readTextFile } from "herdr";
 import * as hub from "./hub.js";
 import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mono, Progress, Spinner, TextField, Tabs, Chip, AlertDialog, openMenu, Icon } from "./ui.js";
 import { loadPrs, prs, prsConfig, ago } from "./prsdata.js";
-import { urgent, urgency } from "./prcards.js";
+import { urgent, urgency, reviewOf } from "./prcards.js";
+import { ModelPicker } from "./modelpick.js";
 import { Drafts } from "./prreview.js";
-import { PrFiles } from "./prfiles.js";
+import { PrFiles, parsePatch } from "./prfiles.js";
 import { installedEditors, openInEditor } from "./editors.js";
-import { CodeBlock, makeCode } from "./codeblock.js";
+import { CodeRows } from "./codeblock.js";
+import { flowGraph, laidOut, Graph, graphSize, fit } from "./diagram.js";
 import { openInSpace, prWorktree, LAUNCH_AGENTS, launchAgent, lastAgent, prPrompt, repoFolder } from "./agentlaunch.js";
 import { OmoModel } from "./agentsui.js";
 
@@ -66,6 +68,14 @@ export default class Prs {
     this.drafts = new Drafts();
     this.pfiles = new PrFiles();
     this.view = null;
+    // The model that explains a pull request and why a comment was made: any of the gateway's, remembered.
+    this.explainModel = new ModelPicker(cx, { placeholder: "Search the gateway's models", store: "cockpit.explain.model" });
+    this.drafts.modelOf = () => this.explainModel.value();
+    this.explain = new Map(); // key -> the explanation (bin/cockpit-explain.py) | "loading" | {error}
+    // The review drafts on disk (what "In progress" lists with the agents working on a PR): key -> {comments, verdict}.
+    this.draftInfo = new Map();
+    this.readDrafts(cx);
+    cx.timer.every(10000, (cx) => this.readDrafts(cx));
     this.omo = new OmoModel();
     this.omo.follow(cx);
     const pull = (cx, force) =>
@@ -104,6 +114,74 @@ export default class Prs {
     else if (p) this.start(cx, p, m[1], m[2]);
   }
 
+  /** Which pull requests have a review draft, and how big it is. */
+  readDrafts(cx) {
+    cx.spawn(async (cx) => {
+      try {
+        const { home } = await hub.install();
+        const dir = `${home}/.cache/cockpit/review-drafts`;
+        const r = await exec("ls", [dir]);
+        const next = new Map();
+        for (const name of r.stdout.split("\n")) {
+          const m = name.match(/^(.+?)__(.+)__(\d+)\.json$/);
+          if (!m) continue;
+          try {
+            const d = JSON.parse((await readTextFile(`${dir}/${name}`)) ?? "{}");
+            const n = (d.comments ?? []).filter((c) => String(c.body ?? "").trim()).length;
+            if (n || String(d.summary ?? "").trim()) next.set(`${m[1]}/${m[2]}#${m[3]}`, { comments: n, verdict: d.verdict });
+          } catch {}
+        }
+        if (JSON.stringify([...next]) !== JSON.stringify([...this.draftInfo])) {
+          this.draftInfo = next;
+          cx.notify();
+        }
+      } catch {}
+    });
+  }
+
+  /** The agents working on each pull request now (their tab is named "review mono#1937", "fix …"): key -> [agent]. */
+  agentsOn() {
+    const out = new Map();
+    for (const a of agents()) {
+      const p = reviewOf(a.tab_name);
+      if (p) out.set(keyOf(p), [...(out.get(keyOf(p)) ?? []), a]);
+    }
+    return out;
+  }
+
+  /** The explanation written earlier for this pull request, if any. */
+  loadExplain(cx, p) {
+    if (this.explain.has(keyOf(p))) return;
+    cx.spawn(async (cx) => {
+      const { home } = await hub.install();
+      const text = await readTextFile(`${home}/.cache/cockpit/explain/${p.repo.replace("/", "__")}__${p.number}.json`).catch(() => null);
+      if (text && !this.explain.has(keyOf(p))) {
+        try {
+          this.explain.set(keyOf(p), JSON.parse(text));
+        } catch {}
+      }
+      cx.notify();
+    });
+  }
+
+  /** Asks the picked gateway model to explain the pull request (bin/cockpit-explain.py pr); a few minutes on a big one. */
+  writeExplain(cx, p) {
+    const model = this.explainModel.value();
+    if (!model) return notify({ title: "Pick a model first", body: "Any of the gateway's models explains it." });
+    this.explain.set(keyOf(p), "loading");
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const { home } = await hub.install();
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-explain.py`, "pr", p.repo, String(p.number), model], { timeout: 600000 });
+        this.explain.set(keyOf(p), JSON.parse(r.stdout || "{}"));
+      } catch (e) {
+        this.explain.set(keyOf(p), { error: String(e?.message ?? e).slice(0, 200) });
+      }
+      cx.notify();
+    });
+  }
+
   list() {
     const d = prs();
     return [...(d?.mine ?? []), ...(d?.assigned ?? [])];
@@ -134,12 +212,7 @@ export default class Prs {
         // The diff around each line comment, in the file's language: +/- in a gutter, the code highlighted.
         for (const it of d.items ?? []) {
           if (it.kind !== "thread" || !it.hunk) continue;
-          const rows = it.hunk.split("\n").filter((l) => !l.startsWith("@@")).slice(-10);
-          it.kinds = rows.map((l) => l[0] ?? " ");
-          it.gutter = it.kinds.map((c) => (c === "+" || c === "-" ? c : ""));
-          try {
-            it.cb = makeCode(rows.map((l) => l.slice(1)), it.path);
-          } catch {}
+          it.rows = parsePatch(it.hunk).flatMap((h) => h.rows).slice(-10).map((r) => ({ num: r.new, old: r.old, t: r.t, text: r.text }));
         }
         this.convo.set(keyOf(p), d);
       } catch (e) {
@@ -312,7 +385,7 @@ export default class Prs {
           )
           .when(open, (e) =>
             e
-              .when(Boolean(it.cb), (x) => x.child(CodeBlock(`${id}-code`, it.cb, { gutter: it.gutter, marks: Object.fromEntries(it.kinds.map((c, j) => [j, c === "+" ? k.success : c === "-" ? k.destructive : null]).filter(([, v]) => v)) })))
+              .when(Boolean(it.rows?.length), (x) => x.child(CodeRows(`${id}-code`, it.rows, it.path)))
               .children(it.comments.map((cm, j) => v_flex().id(`${id}-c${j}`).gap(4).child(head(cm.author, "commented", cm.at)).child(body(cm.body)))),
           );
       }
@@ -368,8 +441,10 @@ export default class Prs {
   }
 
   /** One pull request in the list, as GitHub lists them: a state icon, the title with its flags, then #number, repository, author, when, approvals, CI. */
-  row(k, p) {
+  row(k, p, working = null) {
     const hot = urgent(p);
+    const draft = this.draftInfo.get(keyOf(p));
+    const chip = (label, color) => div().flex_none().px(6).h(16).flex().items_center().rounded(4).text_size(9.5).font_semibold().bg(alpha(color, 0.16)).text_color(color).child(label);
     const c = hot ? k[hot.tone] : this.turnColor(k, p.turn);
     const unresolved = p.unresolved ?? 0;
     return h_flex()
@@ -389,7 +464,7 @@ export default class Prs {
           .flex_1()
           .min_w(0)
           .gap(3)
-          .child(h_flex().gap(8).items_center().child(div().truncate().font_semibold().text_size(TEXT.base).text_color(k.foreground).child(p.title)).when(Boolean(this.pill(k, p)), (e) => e.child(this.pill(k, p))).when(p.draft, (e) => e.child(Badge("draft", "secondary"))))
+          .child(h_flex().gap(8).items_center().child(div().truncate().font_semibold().text_size(TEXT.base).text_color(k.foreground).child(p.title)).when(Boolean(this.pill(k, p)), (e) => e.child(this.pill(k, p))).when(p.draft, (e) => e.child(Badge("draft", "secondary"))).when(Boolean(working?.length), (e) => e.child(chip(working.some((a) => a.status === "working") ? "AGENT WORKING" : "AGENT DONE", k.info))).when(Boolean(draft), (e) => e.child(chip(`REVIEW DRAFT · ${draft.comments}`, k.warning))))
           .child(
             h_flex()
               .gap(8)
@@ -426,6 +501,68 @@ export default class Prs {
     ];
   }
 
+  /** The explanation's flowchart, laid out and drawn as the show view draws one (diagram.js), fitted to the page; text art when an
+   * older explanation has that instead. */
+  explainDiagram(k, p, dg) {
+    if (!dg.nodes?.length) return v_flex().p(12).rounded(RADIUS.md).bg(alpha(k.muted, 0.7)).children(String(dg.art ?? "").split("\n").map((l, i) => div().id(`ex-dg-${i}`).whitespace_nowrap().text_size(11.5).font_family("JetBrains Mono").text_color(l.includes("*") ? k.foreground : k.mutedFg).child(l || " ")));
+    const g = flowGraph({ direction: dg.direction === "right" ? "right" : "down", nodes: dg.nodes.map((n) => ({ id: n.id, label: n.label, kind: n.kind === "box" ? null : n.kind, status: n.changed ? "active" : null })), edges: dg.edges.map((e) => ({ ...e, label: e.label || null })) });
+    const L = laidOut(`explain:${keyOf(p)}:${JSON.stringify(dg.nodes)}:${JSON.stringify(dg.edges)}`, g);
+    const room = Math.max(320, (this.width ?? 1100) - 120);
+    return h_flex().w_full().justify_center().child(Graph(`ex-graph-${keyOf(p)}`, L, { scale: Math.min(1.2, fit(graphSize(L).w, room, 0.4)), hovered: this.exHover ?? null, onHover: (id, cx) => { if (this.exHover !== id) { this.exHover = id; cx.notify(); } } }));
+  }
+
+  /** Explain: what the pull request does and how it differs from its base, written by a gateway model and kept per head. */
+  explainPage(k, p) {
+    const x = this.explain.get(keyOf(p));
+    const card = (id, title, ...kids) => v_flex().id(id).gap(10).p(14).rounded(RADIUS.lg).border_1().border_color(k.border).bg(k.card).child(div().text_size(TEXT.sm).font_semibold().text_color(k.foreground).child(title)).children(kids.filter(Boolean));
+    const ready = x && x !== "loading" && !x.error;
+    const head = v_flex().gap(10).p(14).rounded(RADIUS.lg).border_1().border_color(k.border).bg(k.card)
+      .child(h_flex().gap(8).items_center().child(Icon("sparkles", { size: 16, color: k.ring })).child(div().text_size(TEXT.base).font_semibold().child("Explain this pull request")).child(div().flex_1())
+        .when(ready && x.head !== p.head, (e) => e.child(Badge("written for an older head", "warning")))
+        .when(ready, (e) => e.child(div().text_size(TEXT.xs).text_color(k.dim).child(`${x.model} · ${ago(x.at)} ago`))))
+      .child(div().text_size(TEXT.xs).text_color(k.mutedFg).child("A model of the gateway reads the description and the whole diff against the base, and explains it: it does not judge it. The lines changed per area are counted from the diff."))
+      .child(h_flex().gap(8).items_start().child(div().flex_1().min_w(0).child(this.explainModel.element(k, "explain"))).child(Button("prs-explain-go", { label: x === "loading" ? "Explaining…" : ready ? "Explain again" : "Explain", icon: "sparkles", size: "sm", disabled: x === "loading" || !this.explainModel.value(), tooltip: this.explainModel.value() ? undefined : "Pick a model first", onClick: (_e, cx) => this.writeExplain(cx, p) })));
+    if (!x) return v_flex().gap(12).child(head);
+    if (x === "loading") return v_flex().gap(12).child(head).child(h_flex().h(120).justify_center().items_center().gap(8).text_color(k.mutedFg).child(Spinner({ size: 14 })).child(`${this.explainModel.value()} is reading the diff… a big pull request takes a few minutes.`));
+    if (x.error) return v_flex().gap(12).child(head).child(div().p(10).rounded(RADIUS.md).bg(alpha(k.destructive, 0.1)).text_size(TEXT.sm).text_color(k.foreground).child(x.error));
+    const areas = x.areas ?? [];
+    const max = Math.max(1, ...areas.map((a) => (a.added ?? 0) + (a.removed ?? 0)));
+    const open = (this.explainOpen ??= new Set());
+    return v_flex()
+      .gap(12)
+      .child(head)
+      .child(v_flex().gap(8).child(div().text_size(TEXT.lg).font_semibold().whitespace_normal().child(x.headline ?? "")).child(TextView.markdown(`ex-sum-${keyOf(p)}`, x.summary ?? "").selectable(true).w_full()))
+      .child(
+        card("ex-ba", "Before and after",
+          v_flex().rounded(RADIUS.md).border_1().border_color(k.border).overflow_hidden()
+            .child(h_flex().gap(12).px(10).py(6).bg(k.muted).text_size(TEXT.xs).font_semibold().text_color(k.mutedFg).child(div().w(170).flex_none().child("")).child(div().flex_1().child(`On ${p.base}`)).child(div().flex_1().child("With this change")))
+            .children((x.before_after ?? []).map((r, i) => h_flex().id(`ex-ba-${i}`).gap(12).px(10).py(8).items_start().border_t_1().border_color(k.border).text_size(TEXT.sm).child(div().w(170).flex_none().font_medium().text_color(k.foreground).whitespace_normal().child(r.aspect)).child(div().flex_1().min_w(0).text_color(k.mutedFg).whitespace_normal().child(r.before)).child(div().flex_1().min_w(0).text_color(k.foreground).whitespace_normal().child(r.after)))),
+        ),
+      )
+      .when(Boolean(x.diagram?.nodes?.length || x.diagram?.art), (e) => e.child(card("ex-dg", x.diagram.title || "How it fits together", this.explainDiagram(k, p, x.diagram), div().text_size(TEXT.xs).text_color(k.dim).child(`${x.diagram.caption ?? ""}${x.diagram.nodes ? "  ·  outlined: what this change adds or alters" : "  (* new or changed)"}`))))
+      .child(
+        card("ex-areas", `Where it changes · ${x.files ?? 0} files, +${x.added ?? 0} −${x.removed ?? 0}`,
+          h_flex().gap(12).text_size(TEXT.xs).text_color(k.mutedFg).child(h_flex().gap(4).items_center().child(div().size(8).rounded(2).bg(k.success)).child("lines added")).child(h_flex().gap(4).items_center().child(div().size(8).rounded(2).bg(k.destructive)).child("lines removed")),
+          ...areas.map((a, i) => {
+            const on = open.has(`${keyOf(p)}:${i}`);
+            const w = (n) => Math.max(n ? 3 : 0, Math.round((n / max) * 100));
+            return v_flex().id(`ex-a-${i}`).gap(4).py(4).cursor_pointer().on_click((_e, cx) => { on ? open.delete(`${keyOf(p)}:${i}`) : open.add(`${keyOf(p)}:${i}`); cx.notify(); })
+              .child(h_flex().gap(10).items_center()
+                .child(div().w(220).flex_none().truncate().text_size(TEXT.sm).font_medium().text_color(k.foreground).child(a.name))
+                .child(h_flex().id(`ex-bar-${i}`).flex_1().min_w(0).h(10).gap(2).items_center().tooltip(`${a.name}: +${a.added} −${a.removed} in ${a.files.length} file${a.files.length === 1 ? "" : "s"}`)
+                  .child(div().h(8).rounded(4).bg(k.success).w(`${w(a.added)}%`))
+                  .child(div().h(8).rounded(4).bg(k.destructive).w(`${w(a.removed)}%`)))
+                .child(div().w(110).flex_none().text_right().text_size(TEXT.xs).font_family("JetBrains Mono").text_color(k.mutedFg).child(`+${a.added} −${a.removed} · ${a.files.length}`)))
+              .child(div().text_size(TEXT.xs).text_color(k.mutedFg).whitespace_normal().child(a.what))
+              .when(on, (e) => e.children(a.files.map((f) => div().id(`ex-f-${i}-${f}`).pl(12).text_size(TEXT.xs).font_family("JetBrains Mono").text_color(k.foreground).child(f))));
+          }),
+          div().text_size(TEXT.xs).text_color(k.dim).child("Click an area for its files."),
+        ),
+      )
+      .when((x.watch ?? []).length > 0, (e) => e.child(card("ex-watch", "What you sign up for", ...x.watch.map((t, i) => h_flex().id(`ex-w-${i}`).gap(8).items_start().child(Icon("triangle-alert", { size: 14, color: k.warning })).child(div().flex_1().min_w(0).text_size(TEXT.sm).whitespace_normal().child(t))))))
+      .child(h_flex().gap(8).child(Button("prs-explain-files", { label: "Files changed", icon: "git-commit", size: "sm", variant: "outline", onClick: (_e, cx) => { this.view = "files"; this.pfiles.load(cx, p); cx.notify(); } })));
+  }
+
   detail(k, p, cx) {
     const t = p.turn;
     const tc = this.turnColor(k, t);
@@ -460,6 +597,7 @@ export default class Prs {
               .pt(4)
               .child(Button("prs-open", { label: "Open PR", icon: "external", size: "sm", variant: "outline", onClick: (_e, cx) => cx.spawn(async () => hub.openUrl(p.url)) }))
               .child(Button("prs-files", { label: `Files changed${this.pfiles.files(p) ? ` · ${this.pfiles.files(p).length}` : ""}`, icon: "git-commit", size: "sm", variant: "outline", tooltip: "Every changed file as a diff or in full; click a line to comment on it", onClick: (_e, cx) => { this.view = "files"; this.pfiles.load(cx, p); this.drafts.load(cx, p).then((c) => c && cx.notify()); cx.notify(); } }))
+              .child(Button("prs-explain", { label: "Explain", icon: "sparkles", size: "sm", variant: "outline", tooltip: "What this pull request does and how it differs from main, with a diagram, written by a gateway model", onClick: (_e, cx) => { this.view = "explain"; this.loadExplain(cx, p); cx.notify(); } }))
               .when(this.editors.length > 0, (e) => e.child(Button("prs-openin", { label: "Open in…", icon: "folder", size: "sm", variant: "outline", tooltip: "The pull request's worktree, in an editor", onClick: () => openMenu(this.editors.map(([id, , label]) => ({ label, icon: "code", command: `prs:openin:${id}:${keyOf(p)}` })), { width: 200 }) })))
               .child(Button("prs-worktree", { label: this.worktrees.has(keyOf(p)) ? "Open worktree" : "Explore in a worktree", icon: "git-branch", size: "sm", variant: "outline", tooltip: "A git worktree of this pull request's head in ~/worktrees, opened in a new tab; your own checkout is not touched", onClick: (_e, cx) => this.worktree(cx, p) }))
               .when(this.worktrees.has(keyOf(p)), (e) => e.child(Button("prs-worktree-rm", { label: "Remove worktree", size: "sm", variant: "ghost", onClick: (_e, cx) => this.worktree(cx, p, true) })))
@@ -563,8 +701,10 @@ export default class Prs {
       const hit = list.find((p) => keyOf(p) === want);
       if (hit) { this.scope = "mine"; this.repoF = null; cx.timer.after(1, (cx) => this.select(cx, hit)); }
     }
-    const all = this.scope === "mine" ? d?.mine ?? [] : (d?.assigned ?? []).filter((p) => p.turn?.who !== "none");
-    const inScope = { mine: d?.mine ?? [], review: (d?.assigned ?? []).filter((p) => p.turn?.who !== "none") };
+    const working = this.agentsOn();
+    const progress = list.filter((p) => this.draftInfo.has(keyOf(p)) || working.has(keyOf(p)));
+    const inScope = { mine: d?.mine ?? [], review: (d?.assigned ?? []).filter((p) => p.turn?.who !== "none"), progress };
+    const all = inScope[this.scope] ?? inScope.review;
     const repos = [...new Set(all.map((p) => p.repo))].sort();
     const authors = [...new Set(all.map((p) => p.author))].sort((a, b) => a.localeCompare(b));
     const needle = this.q.value().trim().toLowerCase();
@@ -585,7 +725,8 @@ export default class Prs {
     };
     const shownList = all.filter((p) => (!this.repoF || p.repo === this.repoF) && (!this.authorF || p.author === this.authorF) && reviewOk(p) && matches(p)).sort(sorters[this.sort]);
     const youN = all.filter((p) => p.turn?.who === "you").length;
-    const summary = this.scope === "mine" ? `${youN} on you · ${all.length - youN} waiting` : `${youN} for you · ${all.length - youN} team`;
+    const agentN = all.filter((p) => working.has(keyOf(p))).length;
+    const summary = this.scope === "progress" ? `${agentN} with an agent on it · ${all.length - agentN} drafted` : this.scope === "mine" ? `${youN} on you · ${all.length - youN} waiting` : `${youN} for you · ${all.length - youN} team`;
     const dd = (id, label, items) =>
       h_flex().id(id).h(28).px(8).gap(4).items_center().rounded(RADIUS.md).cursor_pointer().text_size(TEXT.sm).text_color(k.mutedFg).hover((x) => x.bg(k.accent).text_color(k.foreground)).on_click(() => openMenu(items, { width: 240 })).child(div().child(label)).child(Icon("chevron-down", { size: 12 }));
     const pick = (kind, value, label, on) => ({ label, icon: on ? "check" : undefined, command: `prs:filter:${kind}:${value ?? "__all"}` });
@@ -605,7 +746,7 @@ export default class Prs {
           .border_1()
           .border_color(k.border)
           .bg(k.muted)
-          .child(Tabs("prs-scope", { value: this.scope, onChange: (v, cx) => ((this.scope = v), (this.repoF = null), (this.authorF = null), cx.notify()), items: [{ value: "review", label: "To review", count: inScope.review.length }, { value: "mine", label: "Yours", count: inScope.mine.length }] }))
+          .child(Tabs("prs-scope", { value: this.scope, onChange: (v, cx) => ((this.scope = v), (this.repoF = null), (this.authorF = null), cx.notify()), items: [{ value: "review", label: "To review", count: inScope.review.length }, { value: "progress", label: "In progress", count: inScope.progress.length }, { value: "mine", label: "Yours", count: inScope.mine.length }] }))
           .child(div().pl(8).text_size(TEXT.xs).text_color(k.dim).child(summary))
           .child(div().flex_1())
           .child(dd("prs-dd-author", this.authorF ? `Author: ${this.authorF}` : "Author", [pick("author", null, "Anyone", !this.authorF), ...authors.map((a) => pick("author", a, a, this.authorF === a))]))
@@ -623,7 +764,7 @@ export default class Prs {
       .px(24)
       .py(16)
       .child(bar)
-      .child(v_flex().border_x_1().border_b_1().border_color(k.border).rounded_b(RADIUS.lg).children(shownList.length ? shownList.map((p) => this.row(k, p)) : [h_flex().h(120).justify_center().items_center().text_color(k.mutedFg).child("No pull requests match.")]));
+      .child(v_flex().border_x_1().border_b_1().border_color(k.border).rounded_b(RADIUS.lg).children(shownList.length ? shownList.map((p) => this.row(k, p, working.get(keyOf(p)))) : [h_flex().h(120).justify_center().items_center().text_color(k.mutedFg).child(this.scope === "progress" && !progress.length ? "Nothing in progress: a review draft, or an agent started on a pull request, puts it here." : "No pull requests match.")]));
     const sel = list.find((p) => keyOf(p) === this.sel) ?? null;
     const yours = list.filter((p) => p.turn?.who === "you").length;
     return v_flex()
@@ -647,6 +788,28 @@ export default class Prs {
           ? h_flex().h(160).justify_center().items_center().gap(8).text_color(k.mutedFg).child(Spinner({ size: 14 })).child("Asking GitHub…")
           : d.error && !list.length
             ? Empty({ icon: "git-pull-request", title: "Could not read GitHub", description: d.error })
+            : sel && this.view === "files"
+              ? v_flex()
+                  .id("prs-files-page")
+                  .flex_1()
+                  .min_h(0)
+                  .px(24)
+                  .py(16)
+                  .gap(12)
+                  .child(h_flex().flex_none().gap(8).items_center().child(Button("prs-back", { label: sel.title, icon: "chevron-left", variant: "ghost", size: "sm", onClick: (_e, cx) => ((this.view = null), cx.notify()) })).child(div().text_size(TEXT.sm).font_semibold().child("Files changed")))
+                  .child(this.pfiles.render(k, sel, this.drafts, this.cfg))
+            : sel && this.view === "explain"
+              ? v_flex()
+                  .id("prs-explain-scroll")
+                  .on_size_change((size, cx) => { if (Math.abs((this.width ?? 0) - size.width) > 8) { this.width = size.width; cx.notify(); } })
+                  .flex_1()
+                  .min_h(0)
+                  .overflow_y_scrollbar()
+                  .px(24)
+                  .py(16)
+                  .gap(12)
+                  .child(h_flex().gap(8).items_center().child(Button("prs-back", { label: sel.title, icon: "chevron-left", variant: "ghost", size: "sm", onClick: (_e, cx) => ((this.view = null), cx.notify()) })).child(div().text_size(TEXT.sm).font_semibold().child("Explain")))
+                  .child(this.explainPage(k, sel))
             : sel
               ? v_flex()
                   .id("prs-detail-scroll")

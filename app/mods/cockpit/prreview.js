@@ -6,7 +6,7 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState, TextareaState, Textarea, Input, TextView } from "gpui-base";
 import { exec, notify, readTextFile, writeTextFile } from "herdr";
 import * as hub from "./hub.js";
-import { tokens, alpha, TEXT, RADIUS, Badge, Button, Tabs, Mono } from "./ui.js";
+import { tokens, alpha, TEXT, RADIUS, Badge, Button, Tabs, Mono, Spinner } from "./ui.js";
 import { CodeRows } from "./codeblock.js";
 
 const keyOf = (p) => `${p.repo}#${p.number}`;
@@ -30,7 +30,11 @@ export class Drafts {
     this.n = 0;
     // The pull request's files at its head (for the lines a comment is about): `repo#n:path` -> lines, or "loading".
     this.files = new Map();
-    // The highlighted lines of a comment: `repo#n:path:line` -> a code view (made in tasks, never in render).
+    // "Why?" under a comment: the rows whose reason is shown, and the explanations being written.
+    this.whyOpen = new Set();
+    this.whyBusy = new Set();
+    // The gateway model that explains (set by the page).
+    this.modelOf = () => "";
   }
 
   /** Reads the draft file; true when what it shows changed (an agent wrote it, or the first read). */
@@ -98,6 +102,50 @@ export class Drafts {
     return CodeRows(`sn-${path}-${r.start}-${r.end}`, rows, path);
   }
 
+  /** Why a comment was made: the agent's own note, then (asked for) an explanation from the code, the diff and the agent's session. */
+  explainWhy(cx, p, r) {
+    const model = this.modelOf();
+    if (!model) return notify({ title: "Pick a model first", body: "Pick the explaining model under Explain (the PR page's Explain button)." });
+    const e = this.m.get(keyOf(p));
+    if (!e) return;
+    this.whyBusy.add(r.id);
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        await this.save(e);
+        const { home } = await hub.install();
+        const res = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-explain.py`, "why", p.repo, String(p.number), String(e.rows.indexOf(r)), model], { timeout: 300000 });
+        const d = JSON.parse(res.stdout || "{}");
+        if (d.error) notify({ title: "No explanation", body: d.error });
+        else {
+          r.explained = { text: d.text, model: d.model, sources: d.sources ?? [] };
+          this.queueSave(cx, e);
+        }
+      } catch (err) {
+        notify({ title: "No explanation", body: String(err?.message ?? err).slice(0, 160) });
+      }
+      this.whyBusy.delete(r.id);
+      cx.notify();
+    });
+  }
+
+  whyButton(r) {
+    const on = this.whyOpen.has(r.id);
+    return Button(`rv-why-${r.id}`, { label: "Why?", icon: "circle-help", size: "sm", variant: on ? "secondary" : "ghost", tooltip: "Why this comment was made", onClick: (_e, cx) => { on ? this.whyOpen.delete(r.id) : this.whyOpen.add(r.id); cx.notify(); } });
+  }
+
+  whyPanel(k, p, r) {
+    if (!this.whyOpen.has(r.id)) return null;
+    const busy = this.whyBusy.has(r.id);
+    return v_flex().id(`rv-whyp-${r.id}`).gap(8).p(10).rounded(RADIUS.md).border_l_2().border_color(k.info).bg(alpha(k.info, 0.06))
+      .child(div().text_size(TEXT.xs).font_semibold().text_color(k.info).child("Why it was made"))
+      .child(r.why ? v_flex().gap(2).child(div().text_size(TEXT.xs).text_color(k.dim).child("The agent's own note")).child(this.md(`rv-why-own-${r.id}`, r.why)) : div().text_size(TEXT.xs).text_color(k.dim).child("The agent left no note of its reason with this comment."))
+      .children(r.explained ? [div().text_size(TEXT.xs).text_color(k.dim).child(`Explained by ${r.explained.model}${r.explained.sources?.length ? ` from ${r.explained.sources.join(", ")}` : " (no session of the agent found)"}`), this.md(`rv-why-x-${r.id}`, r.explained.text)] : [])
+      .child(h_flex().gap(8).items_center()
+        .child(Button(`rv-why-go-${r.id}`, { label: busy ? "Explaining…" : r.explained ? "Explain again" : `Explain with ${this.modelOf() || "a model"}`, icon: "sparkles", size: "sm", variant: "outline", disabled: busy, tooltip: "Reads the code, the PR's diff of the file and the reviewing agent's session", onClick: (_e, cx) => this.explainWhy(cx, p, r) }))
+        .when(busy, (x) => x.child(Spinner({ size: 12 }))));
+  }
+
   md(id, text) {
     return TextView.markdown(id, text).selectable(true).w_full();
   }
@@ -114,14 +162,14 @@ export class Drafts {
     const line = InputState.new({ placeholder: "line", value: c.line ? (c.start_line && c.start_line < c.line ? `${c.start_line}-${c.line}` : String(c.line)) : "" });
     path.on("change", () => onChange());
     line.on("change", () => onChange());
-    return { id: `r${++this.n}`, reply_to: c.reply_to ?? null, quote: c.quote ?? null, path, line, body: this.area(c.body ?? "", c.reply_to ? "Your reply" : "Your comment on that line", 2, onChange) };
+    return { id: `r${++this.n}`, reply_to: c.reply_to ?? null, quote: c.quote ?? null, why: c.why ?? null, explained: c.explained ?? null, path, line, body: this.area(c.body ?? "", c.reply_to ? "Your reply" : "Your comment on that line", 2, onChange) };
   }
 
   gather(e) {
     return {
       summary: e.summary.value(),
       verdict: e.verdict,
-      comments: e.rows.map((r) => ({ ...(r.reply_to ? { reply_to: r.reply_to, quote: r.quote } : { path: r.path.value().trim(), ...(parseRange(r.line.value()) ? { line: parseRange(r.line.value()).end, ...(parseRange(r.line.value()).start < parseRange(r.line.value()).end ? { start_line: parseRange(r.line.value()).start } : {}) } : { line: null }) }), body: r.body.value() })),
+      comments: e.rows.map((r) => ({ ...(r.reply_to ? { reply_to: r.reply_to, quote: r.quote } : { path: r.path.value().trim(), ...(parseRange(r.line.value()) ? { line: parseRange(r.line.value()).end, ...(parseRange(r.line.value()).start < parseRange(r.line.value()).end ? { start_line: parseRange(r.line.value()).start } : {}) } : { line: null }) }), body: r.body.value(), ...(r.why ? { why: r.why } : {}), ...(r.explained ? { explained: r.explained } : {}) })),
     };
   }
 
@@ -256,12 +304,18 @@ export class Drafts {
         v_flex().gap(8).p(12).rounded(RADIUS.md).border_1().border_color(k.border).bg(k.card)
           .child(h_flex().gap(8).items_center().child(div().text_size(TEXT.sm).font_semibold().child("You")).child(div().text_size(TEXT.sm).text_color(tone).child(verb)))
           .child(text ? this.md(`rv-md-sum-${keyOf(p)}`, text) : div().text_size(TEXT.sm).text_color(k.dim).child("No summary.")),
-        ...e.rows.filter((r) => r.body.value().trim()).map((r) =>
-          v_flex().id(`rv-pv-${r.id}`).gap(6).p(10).rounded(RADIUS.md).border_1().border_color(k.border)
-            .child(r.reply_to ? h_flex().gap(6).child(Badge("reply", "secondary")).child(div().text_size(TEXT.xs).text_color(k.dim).truncate().child(r.quote ?? "in the thread")) : Mono(`${r.path.value()}${r.line.value() ? `:${r.line.value()}` : ""}`, { size: TEXT.xs, color: k.foreground }))
+        ...e.rows.filter((r) => r.body.value().trim()).map((r) => {
+          // As GitHub shows a pending comment: the file and lines on top, the code with the commented lines marked, then the comment.
+          const g = parseRange(r.line.value());
+          return v_flex().id(`rv-pv-${r.id}`).rounded(RADIUS.md).border_1().border_color(k.border).bg(k.card).overflow_hidden()
+            .child(h_flex().gap(8).px(10).py(6).items_center().bg(k.muted).border_b_1().border_color(k.border)
+              .children(r.reply_to ? [Badge("reply", "secondary"), div().flex_1().min_w(0).truncate().text_size(TEXT.xs).text_color(k.dim).child(r.quote ?? "in the thread")] : [Mono(r.path.value(), { size: TEXT.xs, color: k.foreground }), div().flex_1(), div().text_size(TEXT.xs).text_color(k.dim).child(g ? (g.start === g.end ? `line ${g.start}` : `lines ${g.start}–${g.end}`) : "no line")]))
             .children([!r.reply_to ? this.snippet(k, p, r.path.value().trim(), r.line.value()) : null].filter(Boolean))
-            .child(this.md(`rv-md-${r.id}`, r.body.value())),
-        ),
+            .child(v_flex().gap(6).p(10)
+              .child(h_flex().gap(8).items_center().child(div().size(20).flex_none().rounded(10).flex().items_center().justify_center().bg(alpha(k.info, 0.18)).text_size(10).font_semibold().text_color(k.info).child("Y")).child(div().text_size(TEXT.sm).font_semibold().child("You")).child(Badge("Pending", "warning")).child(div().flex_1()).child(this.whyButton(r)))
+              .child(this.md(`rv-md-${r.id}`, r.body.value()))
+              .children([this.whyPanel(k, p, r)].filter(Boolean)));
+        }),
         div().text_size(TEXT.xs).text_color(k.dim).child(`${lines} line comment${lines === 1 ? "" : "s"} and ${replies} repl${replies === 1 ? "y" : "ies"}; empty ones are left out.`),
         h_flex().justify_end().child(actions),
       );
@@ -277,12 +331,14 @@ export class Drafts {
               .children(
                 r.reply_to
                   ? [Badge("reply", "secondary"), div().flex_1().min_w(0).truncate().text_size(TEXT.xs).text_color(k.dim).child(r.quote ?? "to a thread")]
-                  : [div().w(300).h(26).px(8).flex().items_center().rounded(RADIUS.sm).border_1().border_color(k.input).bg(k.background).child(Input.new(r.path).flex_1().h_full().text_size(TEXT.xs).text_color(k.foreground)), div().text_color(k.dim).child(":"), div().w(64).h(26).px(8).flex().items_center().rounded(RADIUS.sm).border_1().border_color(k.input).bg(k.background).child(Input.new(r.line).flex_1().h_full().text_size(TEXT.xs).text_color(k.foreground)), div().flex_1()],
+                  : [div().flex_1().min_w(120).px(8).py(4).flex().items_center().rounded(RADIUS.sm).border_1().border_color(k.input).bg(k.background).child(Input.new(r.path).flex_1().text_size(TEXT.xs).text_color(k.foreground)), div().text_color(k.dim).child(":"), div().min_w(72).px(8).py(4).flex().items_center().rounded(RADIUS.sm).border_1().border_color(k.input).bg(k.background).tooltip("A line, or a range: 12-18").child(Input.new(r.line).flex_1().text_size(TEXT.xs).text_color(k.foreground))],
               )
+              .children(r.reply_to ? [] : [this.whyButton(r)])
               .child(Button(`rv-rm-${r.id}`, { label: "Remove", size: "sm", variant: "ghost", onClick: (_e, cx) => { e.rows = e.rows.filter((x) => x !== r); this.queueSave(cx, e); cx.notify(); } })),
           )
           .children([!r.reply_to ? this.snippet(k, p, r.path.value().trim(), r.line.value()) : null].filter(Boolean))
-          .child(this.box(k, r.body)),
+          .child(this.box(k, r.body))
+          .children([this.whyPanel(k, p, r)].filter(Boolean)),
       ),
       h_flex().gap(8).items_center().child(Button("rv-add", { label: "Add a line comment", icon: "plus", size: "sm", variant: "ghost", onClick: (_e, cx) => this.addComment(cx, p) })).children([agentButton].filter(Boolean)).child(div().flex_1()).child(Tabs("rv-verdict", { value: e.verdict, onChange: setVerdict, items: VERDICTS.map(([value, label]) => ({ value, label })) })),
       h_flex().justify_end().child(actions),

@@ -1,94 +1,14 @@
-// Code with the language's colours, read-only: the diff around a review comment and the lines a draft comment is on.
-// Built on the editor's own highlighting (code.js uses it for files); a gutter of +/- or line numbers sits beside it.
+// Code with the language's colours, read-only: the diff around a review comment, the lines a draft comment is on, a pull
+// request's hunks and whole files. Each line is one row (its numbers, its sign, its text) that takes the height it needs:
+// long lines wrap, nothing has a fixed size and nothing scrolls on its own, so the page around it scrolls as one.
 
-import { div } from "gpui-kit";
-import { h_flex, v_flex, Editor, EditorState } from "gpui-base";
-import { settings, theme } from "herdr";
+import { div, list } from "gpui-kit";
+import { h_flex, v_flex } from "gpui-base";
+import { theme } from "herdr";
 import { tokens, alpha } from "./ui.js";
 
-const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", cjs: "js", toml: "yaml", yml: "yaml", jsonc: "json", svelte: "html", vue: "html", htm: "html", md: "markdown", py: "python", rs: "rust", sh: "bash", zsh: "bash", ex: "elixir", exs: "elixir" };
-const FONT = 11;
 export const LINE = 18;
-
-/** A highlighted, read-only view of `lines` (a file's extension picks the language). Make it in an event handler or a task, not in render. */
-export function makeCode(lines, path) {
-  const ext = String(path ?? "").split(".").pop().toLowerCase();
-  const t = theme();
-  const base = { readonly: true, line_numbers: false, folding: false, soft_wrap: false, font_family: settings().font_family, font_size: FONT, value: lines.join("\n"), syntax: { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6, boolean: t.ansi6 } };
-  let state;
-  try {
-    state = EditorState.new({ ...base, language: LANG[ext] ?? ext });
-  } catch {
-    state = EditorState.new(base);
-  }
-  return { state, lines: lines.length };
-}
-
-/** The view: `gutter` is one label per line (a line number, or +, -, blank for a diff), `marks` the lines to tint (index -> color). */
-export function CodeBlock(id, code, { gutter = [], marks = {} } = {}) {
-  const k = tokens();
-  return h_flex()
-    .id(id)
-    .w_full()
-    .rounded(6)
-    .bg(alpha(k.muted, 0.7))
-    .overflow_hidden()
-    .child(
-      v_flex()
-        .flex_none()
-        .py(4)
-        .children(code.state && gutter.map((g, i) => div().id(`${id}-g${i}`).h(LINE).px(8).min_w(32).flex().items_center().justify_end().text_size(10.5).font_family("JetBrains Mono").text_color(marks[i] ?? k.dim).bg(marks[i] ? alpha(marks[i], 0.14) : alpha(k.muted, 0)).child(g))),
-    )
-    .child(div().flex_1().min_w(0).h(code.lines * LINE + 8).py(4).child(Editor.new(code.state).size_full()));
-}
-
-/**
- * A hunk of a diff: `rows` are {t: "+" | "-" | " ", old, new} for each line of `code`; the new line's number is the button that
- * starts a comment on it (`onLine(newLine)`); `marked` is a Set of new lines that have a pending comment.
- */
-export function DiffBlock(id, code, rows, { onLine, marked = new Set() } = {}) {
-  const k = tokens();
-  const tint = (t) => (t === "+" ? alpha(k.success, 0.16) : t === "-" ? alpha(k.destructive, 0.16) : null);
-  return h_flex()
-    .id(id)
-    .w_full()
-    .rounded(6)
-    .bg(alpha(k.muted, 0.7))
-    .overflow_hidden()
-    .child(
-      v_flex()
-        .flex_none()
-        .py(4)
-        .children(
-          rows.map((r, i) =>
-            h_flex()
-              .id(`${id}-r${i}`)
-              .h(LINE)
-              .bg(tint(r.t) ?? alpha(k.muted, 0))
-              .child(div().w(38).flex_none().px(4).flex().items_center().justify_end().text_size(10.5).font_family("JetBrains Mono").text_color(k.dim).child(r.old ? String(r.old) : ""))
-              .child(
-                div()
-                  .id(`${id}-n${i}`)
-                  .w(44)
-                  .flex_none()
-                  .px(4)
-                  .flex()
-                  .items_center()
-                  .justify_end()
-                  .gap(3)
-                  .text_size(10.5)
-                  .font_family("JetBrains Mono")
-                  .text_color(marked.has(r.new) ? k.warning : k.mutedFg)
-                  .when(Boolean(r.new && onLine), (e) => e.cursor_pointer().hover((x) => x.bg(alpha(k.ring, 0.25))).tooltip("Comment on this line").on_click((_e, cx) => onLine(r.new, cx)))
-                  .child(marked.has(r.new) ? "●" : "")
-                  .child(r.new ? String(r.new) : ""),
-              )
-              .child(div().w(14).flex_none().flex().items_center().justify_center().text_size(10.5).font_family("JetBrains Mono").text_color(r.t === "+" ? k.success : r.t === "-" ? k.destructive : k.dim).child(r.t === " " ? "" : r.t)),
-          ),
-        ),
-    )
-    .child(div().flex_1().min_w(0).h(code.lines * LINE + 8).py(4).child(Editor.new(code.state).size_full()));
-}
+const MONO = "JetBrains Mono";
 
 const KEYWORDS = new Set("fn let mut pub struct enum impl trait use mod match if else for while loop return async await move ref as in where const static type self Self crate super dyn unsafe def class import from with try except finally raise lambda None True False yield pass elif not and or is function var export default new this null undefined true false switch case break continue throw typeof message service rpc optional repeated required oneof map package syntax option rec inherit then".split(" "));
 
@@ -109,33 +29,102 @@ function spans(line, ext, c) {
   return out;
 }
 
-/**
- * Code as rows that take the height they need (no fixed box): `rows` are {num, text, mark} (mark: a color to tint the line with). For
- * the lines a review comment is on, and the like. The language comes from the file's extension.
- */
-export function CodeRows(id, rows, path) {
-  const k = tokens();
+function palette() {
   const t = theme();
-  const c = { comment: t.dim, string: t.ansi2, number: t.ansi1, keyword: t.ansi5, type: t.ansi3 };
-  const ext = String(path ?? "").split(".").pop().toLowerCase();
+  return { comment: t.dim, string: t.ansi2, number: t.ansi1, keyword: t.ansi5, type: t.ansi3 };
+}
+
+const extOf = (path) => String(path ?? "").split(".").pop().toLowerCase();
+
+/** The text of one line, coloured, wrapping between tokens (indentation kept). `ids`: false inside a lazy list. */
+function text(id, line, ext, c, k, ids = true) {
+  const parts = spans(line || " ", ext, c);
+  return h_flex()
+    .flex_1()
+    .min_w(0)
+    .flex_wrap()
+    .text_size(11)
+    .font_family(MONO)
+    .text_color(k.foreground)
+    .children(parts.map((s, j) => (ids ? div().id(`${id}-${j}`) : div()).whitespace_nowrap().text_color(s.color ?? k.foreground).child(s.text)));
+}
+
+/**
+ * Rows of code: {num, old?, t?, text, mark?}. `num` is the line (the new side in a diff), `old` the old side's (shown when any row
+ * has one), `t` "+", "-" or " " (a diff's sign and tint), `mark` a color the whole line is tinted with (a comment's range).
+ * `onLine(num, event, cx)` makes a line's number the button that starts a comment there; `marked` (a Set of nums) puts a dot by it.
+ */
+export function CodeRows(id, rows, path, { onLine, marked } = {}) {
+  const k = tokens();
+  const c = palette();
+  const ext = extOf(path);
+  const diff = rows.some((r) => r.old != null || r.t === "-" || r.t === "+");
+  const tint = (r) => (r.mark ? alpha(r.mark, 0.2) : r.t === "+" ? alpha(k.success, 0.14) : r.t === "-" ? alpha(k.destructive, 0.14) : null);
   return v_flex()
     .id(id)
     .w_full()
     .py(4)
     .rounded(6)
     .bg(alpha(k.muted, 0.7))
-    .overflow_x_scrollbar()
+    .overflow_hidden()
     .children(
-      rows.map((r, i) =>
-        h_flex()
+      rows.map((r, i) => {
+        const dot = marked?.has(r.num);
+        return h_flex()
           .id(`${id}-${i}`)
-          .gap(10)
-          .px(8)
+          .w_full()
+          .items_start()
           .min_h(LINE)
-          .items_center()
-          .bg(r.mark ? alpha(r.mark, 0.18) : alpha(k.muted, 0))
-          .child(div().w(38).flex_none().flex().justify_end().text_size(10.5).font_family("JetBrains Mono").text_color(r.mark ? k.foreground : k.dim).child(r.num == null ? "" : String(r.num)))
-          .child(h_flex().whitespace_nowrap().text_size(11).font_family("JetBrains Mono").text_color(k.foreground).children(spans(r.text || " ", ext, c).map((s, j) => div().id(`${id}-${i}-${j}`).whitespace_nowrap().text_color(s.color ?? k.foreground).child(s.text)))),
-      ),
+          .bg(tint(r) ?? alpha(k.muted, 0))
+          .when(Boolean(r.mark), (e) => e.border_l_2().border_color(r.mark))
+          .when(diff, (e) => e.child(div().w(40).flex_none().px(4).h(LINE).flex().items_center().justify_end().text_size(10.5).font_family(MONO).text_color(k.dim).child(r.old != null ? String(r.old) : "")))
+          .child(
+            div()
+              .id(`${id}-n${i}`)
+              .w(46)
+              .flex_none()
+              .px(4)
+              .h(LINE)
+              .flex()
+              .items_center()
+              .justify_end()
+              .gap(3)
+              .text_size(10.5)
+              .font_family(MONO)
+              .text_color(dot || r.mark ? k.warning : k.dim)
+              .when(Boolean(onLine && r.num != null), (e) => e.cursor_pointer().hover((x) => x.bg(alpha(k.ring, 0.25))).tooltip("Comment on this line (shift-click: to here)").on_click((ev, cx) => onLine(r.num, ev, cx)))
+              .child(dot ? "●" : "")
+              .child(r.num != null ? String(r.num) : ""),
+          )
+          .when(diff, (e) => e.child(div().w(14).flex_none().h(LINE).flex().items_center().justify_center().text_size(10.5).font_family(MONO).text_color(r.t === "+" ? k.success : r.t === "-" ? k.destructive : k.dim).child(r.t === "+" || r.t === "-" ? r.t : "")))
+          .child(div().flex_1().min_w(0).pl(diff ? 2 : 10).pr(8).py(1).child(text(`${id}-t${i}`, r.text, ext, c, k)));
+      }),
     );
+}
+
+/**
+ * A whole file, drawn lazily (only the lines on screen): `changed` a Set of lines the PR adds (tinted green), `marks` line ->
+ * color (a comment's range), `onLine(num, cx)` when a line is clicked. It scrolls itself: give it a bounded height.
+ */
+export function FileRows(id, lines, path, { changed = new Set(), marks = new Map(), onLine } = {}) {
+  const k = tokens();
+  const c = palette();
+  const ext = extOf(path);
+  const l = list(
+    id,
+    lines.length,
+    (i) => String(i + 1),
+    (i) => {
+      const n = i + 1, mark = marks.get(n);
+      return h_flex()
+        .w_full()
+        .items_start()
+        .min_h(LINE)
+        .bg(mark ? alpha(mark, 0.2) : changed.has(n) ? alpha(k.success, 0.14) : alpha(k.muted, 0))
+        .child(div().w(52).flex_none().px(6).h(LINE).flex().items_center().justify_end().text_size(10.5).font_family(MONO).text_color(mark ? k.warning : k.dim).child(String(n)))
+        .child(div().w(14).flex_none().h(LINE).flex().items_center().justify_center().text_size(10.5).font_family(MONO).text_color(k.success).child(changed.has(n) ? "+" : ""))
+        .child(div().flex_1().min_w(0).pr(8).py(1).child(text("", lines[i], ext, c, k, false)));
+    },
+  );
+  return onLine ? l.on_item_click((key, cx) => onLine(Number(key), cx)) : l;
 }
