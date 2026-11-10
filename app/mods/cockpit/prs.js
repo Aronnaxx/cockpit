@@ -5,7 +5,7 @@
 
 import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState, TextView } from "gpui-base";
-import { exec, notify, run, shared, setShared, agents, readTextFile } from "herdr";
+import { exec, notify, run, shared, setShared, agents, readTextFile, writeTextFile } from "herdr";
 import * as hub from "./hub.js";
 import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mono, Progress, Spinner, TextField, Tabs, Chip, AlertDialog, openMenu, Icon } from "./ui.js";
 import { loadPrs, prs, prsConfig, ago } from "./prsdata.js";
@@ -71,6 +71,7 @@ export default class Prs {
     // The model that explains a pull request and why a comment was made: any of the gateway's, remembered.
     this.explainModel = new ModelPicker(cx, { placeholder: "Search the gateway's models", store: "cockpit.explain.model" });
     this.drafts.modelOf = () => this.explainModel.value();
+    this.quiz = new Map(); // key -> the quiz (bin/cockpit-explain.py quiz) with your answers | "loading" | {error}
     this.explain = new Map(); // key -> the explanation (bin/cockpit-explain.py) | "loading" | {error}
     // The review drafts on disk (what "In progress" lists with the agents working on a PR): key -> {comments, verdict}.
     this.draftInfo = new Map();
@@ -157,7 +158,15 @@ export default class Prs {
       const text = await readTextFile(`${home}/.cache/cockpit/explain/${p.repo.replace("/", "__")}__${p.number}.json`).catch(() => null);
       if (text && !this.explain.has(keyOf(p))) {
         try {
-          this.explain.set(keyOf(p), JSON.parse(text));
+          const d = JSON.parse(text);
+          this.explain.set(keyOf(p), d);
+          // One the reviewing agent wrote (the cockpit-pr-review skill) has no line counts yet: counted from the diff.
+          if (d.files == null || !d.head) {
+            cx.notify();
+            const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-explain.py`, "fill", p.repo, String(p.number)], { timeout: 180000 });
+            const filled = JSON.parse(r.stdout || "{}");
+            if (!filled.error) this.explain.set(keyOf(p), filled);
+          }
         } catch {}
       }
       cx.notify();
@@ -193,6 +202,7 @@ export default class Prs {
     this.task = null;
     if (!this.convo.has(keyOf(p))) this.readConvo(cx, p);
     this.drafts.load(cx, p).then((c) => c && cx.notify());
+    this.loadQuiz(cx, p);
     if (p.role === "author" && (p.behind ?? 0) > 0) this.checkMerge(cx, p);
     const url = p.ci?.builds?.[0];
     if (url && !this.ci.has(url)) {
@@ -519,7 +529,7 @@ export default class Prs {
     const head = v_flex().gap(10).p(14).rounded(RADIUS.lg).border_1().border_color(k.border).bg(k.card)
       .child(h_flex().gap(8).items_center().child(Icon("sparkles", { size: 16, color: k.ring })).child(div().text_size(TEXT.base).font_semibold().child("Explain this pull request")).child(div().flex_1())
         .when(ready && x.head !== p.head, (e) => e.child(Badge("written for an older head", "warning")))
-        .when(ready, (e) => e.child(div().text_size(TEXT.xs).text_color(k.dim).child(`${x.model} · ${ago(x.at)} ago`))))
+        .when(ready, (e) => e.child(div().text_size(TEXT.xs).text_color(k.dim).child(`${x.by_agent ? "written while reviewing by " : ""}${x.model ?? "?"}${x.at ? ` · ${ago(x.at)} ago` : ""}`))))
       .child(div().text_size(TEXT.xs).text_color(k.mutedFg).child("A model of the gateway reads the description and the whole diff against the base, and explains it: it does not judge it. The lines changed per area are counted from the diff."))
       .child(h_flex().gap(8).items_start().child(div().flex_1().min_w(0).child(this.explainModel.element(k, "explain"))).child(Button("prs-explain-go", { label: x === "loading" ? "Explaining…" : ready ? "Explain again" : "Explain", icon: "sparkles", size: "sm", disabled: x === "loading" || !this.explainModel.value(), tooltip: this.explainModel.value() ? undefined : "Pick a model first", onClick: (_e, cx) => this.writeExplain(cx, p) })));
     if (!x) return v_flex().gap(12).child(head);
@@ -545,22 +555,129 @@ export default class Prs {
           h_flex().gap(12).text_size(TEXT.xs).text_color(k.mutedFg).child(h_flex().gap(4).items_center().child(div().size(8).rounded(2).bg(k.success)).child("lines added")).child(h_flex().gap(4).items_center().child(div().size(8).rounded(2).bg(k.destructive)).child("lines removed")),
           ...areas.map((a, i) => {
             const on = open.has(`${keyOf(p)}:${i}`);
-            const w = (n) => Math.max(n ? 3 : 0, Math.round((n / max) * 100));
+            const w = (n) => Math.max(n ? 3 : 0, Math.round(((n ?? 0) / max) * 100));
             return v_flex().id(`ex-a-${i}`).gap(4).py(4).cursor_pointer().on_click((_e, cx) => { on ? open.delete(`${keyOf(p)}:${i}`) : open.add(`${keyOf(p)}:${i}`); cx.notify(); })
               .child(h_flex().gap(10).items_center()
                 .child(div().w(220).flex_none().truncate().text_size(TEXT.sm).font_medium().text_color(k.foreground).child(a.name))
-                .child(h_flex().id(`ex-bar-${i}`).flex_1().min_w(0).h(10).gap(2).items_center().tooltip(`${a.name}: +${a.added} −${a.removed} in ${a.files.length} file${a.files.length === 1 ? "" : "s"}`)
+                .child(h_flex().id(`ex-bar-${i}`).flex_1().min_w(0).h(10).gap(2).items_center().tooltip(`${a.name}: +${a.added ?? "?"} −${a.removed ?? "?"} in ${(a.files ?? []).length} file${(a.files ?? []).length === 1 ? "" : "s"}`)
                   .child(div().h(8).rounded(4).bg(k.success).w(`${w(a.added)}%`))
                   .child(div().h(8).rounded(4).bg(k.destructive).w(`${w(a.removed)}%`)))
-                .child(div().w(110).flex_none().text_right().text_size(TEXT.xs).font_family("JetBrains Mono").text_color(k.mutedFg).child(`+${a.added} −${a.removed} · ${a.files.length}`)))
+                .child(div().w(110).flex_none().text_right().text_size(TEXT.xs).font_family("JetBrains Mono").text_color(k.mutedFg).child(a.added == null ? "counting…" : `+${a.added} −${a.removed} · ${a.files.length}`)))
               .child(div().text_size(TEXT.xs).text_color(k.mutedFg).whitespace_normal().child(a.what))
-              .when(on, (e) => e.children(a.files.map((f) => div().id(`ex-f-${i}-${f}`).pl(12).text_size(TEXT.xs).font_family("JetBrains Mono").text_color(k.foreground).child(f))));
+              .when(on, (e) => e.children((a.files ?? []).map((f) => div().id(`ex-f-${i}-${f}`).pl(12).text_size(TEXT.xs).font_family("JetBrains Mono").text_color(k.foreground).child(f))));
           }),
           div().text_size(TEXT.xs).text_color(k.dim).child("Click an area for its files."),
         ),
       )
       .when((x.watch ?? []).length > 0, (e) => e.child(card("ex-watch", "What you sign up for", ...x.watch.map((t, i) => h_flex().id(`ex-w-${i}`).gap(8).items_start().child(Icon("triangle-alert", { size: 14, color: k.warning })).child(div().flex_1().min_w(0).text_size(TEXT.sm).whitespace_normal().child(t))))))
       .child(h_flex().gap(8).child(Button("prs-explain-files", { label: "Files changed", icon: "git-commit", size: "sm", variant: "outline", onClick: (_e, cx) => { this.view = "files"; this.pfiles.load(cx, p); cx.notify(); } })));
+  }
+
+  /** The quiz written earlier for this pull request, with your answers, if any. */
+  loadQuiz(cx, p) {
+    if (this.quiz.has(keyOf(p))) return;
+    cx.spawn(async (cx) => {
+      const { home } = await hub.install();
+      const text = await readTextFile(`${home}/.cache/cockpit/quiz/${p.repo.replace("/", "__")}__${p.number}.json`).catch(() => null);
+      if (text && !this.quiz.has(keyOf(p))) {
+        try {
+          const d = JSON.parse(text);
+          this.quiz.set(keyOf(p), d);
+          for (const q of d.questions ?? []) if (q.path) this.drafts.ensureFile(cx, p, q.path);
+        } catch {}
+      }
+      cx.notify();
+    });
+  }
+
+  /** A new quiz from the picked gateway model (bin/cockpit-explain.py quiz): the change and the draft's comments. */
+  writeQuiz(cx, p) {
+    const model = this.explainModel.value();
+    if (!model) return notify({ title: "Pick a model first", body: "Any of the gateway's models writes the quiz." });
+    this.quiz.set(keyOf(p), "loading");
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const { home } = await hub.install();
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-explain.py`, "quiz", p.repo, String(p.number), model], { timeout: 600000 });
+        const d = JSON.parse(r.stdout || "{}");
+        this.quiz.set(keyOf(p), d);
+        for (const q of d.questions ?? []) if (q.path) this.drafts.ensureFile(cx, p, q.path);
+      } catch (e) {
+        this.quiz.set(keyOf(p), { error: String(e?.message ?? e).slice(0, 200) });
+      }
+      cx.notify();
+    });
+  }
+
+  /** Your answer, kept in the quiz's file so the score stays. */
+  answer(cx, p, qi, choice) {
+    const d = this.quiz.get(keyOf(p));
+    if (!d?.questions || d.answers?.[qi] != null) return;
+    d.answers = { ...(d.answers ?? {}), [qi]: choice };
+    cx.notify();
+    cx.spawn(async () => {
+      const { home } = await hub.install();
+      const file = `${home}/.cache/cockpit/quiz/${p.repo.replace("/", "__")}__${p.number}.json`;
+      const cur = await readTextFile(file).catch(() => null);
+      await writeTextFile(file, JSON.stringify(d), cur).catch(() => {});
+    });
+  }
+
+  /** {answered, right, total} of the quiz, or null when there is none. */
+  quizScore(p) {
+    const d = this.quiz.get(keyOf(p));
+    if (!d?.questions?.length) return null;
+    const a = d.answers ?? {};
+    const answered = Object.keys(a).length;
+    return { answered, right: d.questions.filter((q, i) => a[i] === q.answer).length, total: d.questions.length };
+  }
+
+  /** Quiz me: questions on the change and on the draft's comments, so what you post is what you understand. */
+  quizPage(k, p) {
+    const x = this.quiz.get(keyOf(p));
+    const ready = x && x !== "loading" && !x.error && x.questions;
+    const sc = this.quizScore(p);
+    const head = v_flex().gap(10).p(14).rounded(RADIUS.lg).border_1().border_color(k.border).bg(k.card)
+      .child(h_flex().gap(8).items_center().child(Icon("circle-help", { size: 16, color: k.ring })).child(div().text_size(TEXT.base).font_semibold().child("Quiz me on this pull request")).child(div().flex_1())
+        .when(ready && x.head !== p.head, (e) => e.child(Badge("written for an older head", "warning")))
+        .when(Boolean(sc), (e) => e.child(Badge(`${sc.right}/${sc.total} right${sc.answered < sc.total ? ` · ${sc.total - sc.answered} to go` : ""}`, sc.answered < sc.total ? "secondary" : sc.right / sc.total >= 0.75 ? "success" : "warning"))))
+      .child(div().text_size(TEXT.xs).text_color(k.mutedFg).child("Before your name goes on the review: what the change does, how it behaves, and whether the agent's comments hold up. Answer first; the why shows after."))
+      .child(h_flex().gap(8).items_start().child(div().flex_1().min_w(0).child(this.explainModel.element(k, "quiz"))).child(Button("prs-quiz-go", { label: x === "loading" ? "Writing…" : ready ? "New quiz" : "Write the quiz", icon: "sparkles", size: "sm", disabled: x === "loading" || !this.explainModel.value(), tooltip: this.explainModel.value() ? undefined : "Pick a model first", onClick: (_e, cx) => this.writeQuiz(cx, p) })));
+    if (!x) return v_flex().gap(12).child(head);
+    if (x === "loading") return v_flex().gap(12).child(head).child(h_flex().h(120).justify_center().items_center().gap(8).text_color(k.mutedFg).child(Spinner({ size: 14 })).child(`${this.explainModel.value()} is reading the diff and the draft…`));
+    if (x.error) return v_flex().gap(12).child(head).child(div().p(10).rounded(RADIUS.md).bg(alpha(k.destructive, 0.1)).text_size(TEXT.sm).child(x.error));
+    const ABOUT = { behaviour: "How it behaves", design: "Why it is built this way", risk: "What could break", comment: "An agent's comment" };
+    const answers = x.answers ?? {};
+    return v_flex()
+      .gap(12)
+      .child(head)
+      .children(
+        x.questions.map((q, i) => {
+          const got = answers[i];
+          const done = got != null;
+          const range = q.start_line ? `${q.start_line}-${q.line}` : q.line ? String(q.line) : "";
+          return v_flex().id(`qz-${i}`).gap(10).p(14).rounded(RADIUS.lg).border_1().border_color(!done ? k.border : got === q.answer ? alpha(k.success, 0.6) : alpha(k.destructive, 0.6)).bg(k.card)
+            .child(h_flex().gap(8).items_center().child(div().text_size(TEXT.xs).text_color(k.dim).child(`${i + 1} / ${x.questions.length}`)).child(Badge(ABOUT[q.about] ?? q.about, q.about === "comment" ? "info" : "secondary")).when(Boolean(q.path), (e) => e.child(Mono(`${q.path}${range ? `:${range}` : ""}`, { size: TEXT.xs, color: k.mutedFg }))))
+            .children(q.path && q.about === "comment" ? [this.drafts.snippet(k, p, q.path, range)].filter(Boolean) : [])
+            .child(TextView.markdown(`qz-q-${keyOf(p)}-${i}`, q.question).selectable(true).w_full())
+            .child(
+              v_flex().gap(6).children(
+                q.choices.map((c, j) => {
+                  const right = j === q.answer, mine = j === got;
+                  const tone = !done ? null : right ? k.success : mine ? k.destructive : null;
+                  return h_flex().id(`qz-${i}-${j}`).gap(10).px(10).py(8).items_start().rounded(RADIUS.md).border_1()
+                    .border_color(tone ? alpha(tone, 0.7) : k.border).bg(tone ? alpha(tone, 0.08) : k.background)
+                    .when(!done, (e) => e.cursor_pointer().hover((h) => h.bg(k.accent)).on_click((_e, cx) => this.answer(cx, p, i, j)))
+                    .child(div().w(18).flex_none().text_size(TEXT.sm).font_semibold().text_color(tone ?? k.mutedFg).child(done && right ? "✓" : done && mine ? "✗" : "ABCD"[j] ?? "·"))
+                    .child(div().flex_1().min_w(0).text_size(TEXT.sm).whitespace_normal().text_color(k.foreground).child(c));
+                }),
+              ),
+            )
+            .when(done, (e) => e.child(v_flex().gap(4).p(10).rounded(RADIUS.md).border_l_2().border_color(got === q.answer ? k.success : k.destructive).bg(alpha(k.info, 0.05)).child(div().text_size(TEXT.xs).font_semibold().text_color(got === q.answer ? k.success : k.destructive).child(got === q.answer ? "Right" : "Not quite")).child(TextView.markdown(`qz-x-${keyOf(p)}-${i}`, q.explain ?? "").selectable(true).w_full())));
+        }),
+      )
+      .when(Boolean(sc) && sc.answered === sc.total, (e) => e.child(h_flex().gap(10).p(14).items_center().rounded(RADIUS.lg).bg(alpha(sc.right / sc.total >= 0.75 ? k.success : k.warning, 0.1)).child(div().flex_1().text_size(TEXT.sm).child(sc.right / sc.total >= 0.75 ? `${sc.right} of ${sc.total}: you know this change.` : `${sc.right} of ${sc.total}: worth another look before posting: Explain and Files changed have the parts you missed.`)).child(Button("prs-quiz-back", { label: "Back to the review", size: "sm", variant: "outline", onClick: (_e, cx) => ((this.view = null), cx.notify()) }))));
   }
 
   detail(k, p, cx) {
@@ -598,6 +715,7 @@ export default class Prs {
               .child(Button("prs-open", { label: "Open PR", icon: "external", size: "sm", variant: "outline", onClick: (_e, cx) => cx.spawn(async () => hub.openUrl(p.url)) }))
               .child(Button("prs-files", { label: `Files changed${this.pfiles.files(p) ? ` · ${this.pfiles.files(p).length}` : ""}`, icon: "git-commit", size: "sm", variant: "outline", tooltip: "Every changed file as a diff or in full; click a line to comment on it", onClick: (_e, cx) => { this.view = "files"; this.pfiles.load(cx, p); this.drafts.load(cx, p).then((c) => c && cx.notify()); cx.notify(); } }))
               .child(Button("prs-explain", { label: "Explain", icon: "sparkles", size: "sm", variant: "outline", tooltip: "What this pull request does and how it differs from main, with a diagram, written by a gateway model", onClick: (_e, cx) => { this.view = "explain"; this.loadExplain(cx, p); cx.notify(); } }))
+              .child(Button("prs-quiz", { label: this.quizScore(p) ? `Quiz · ${this.quizScore(p).right}/${this.quizScore(p).total}` : "Quiz me", icon: "circle-help", size: "sm", variant: "outline", tooltip: "Questions on the change and on the agent's comments, before your name goes on the review", onClick: (_e, cx) => { this.view = "quiz"; this.loadQuiz(cx, p); cx.notify(); } }))
               .when(this.editors.length > 0, (e) => e.child(Button("prs-openin", { label: "Open in…", icon: "folder", size: "sm", variant: "outline", tooltip: "The pull request's worktree, in an editor", onClick: () => openMenu(this.editors.map(([id, , label]) => ({ label, icon: "code", command: `prs:openin:${id}:${keyOf(p)}` })), { width: 200 }) })))
               .child(Button("prs-worktree", { label: this.worktrees.has(keyOf(p)) ? "Open worktree" : "Explore in a worktree", icon: "git-branch", size: "sm", variant: "outline", tooltip: "A git worktree of this pull request's head in ~/worktrees, opened in a new tab; your own checkout is not touched", onClick: (_e, cx) => this.worktree(cx, p) }))
               .when(this.worktrees.has(keyOf(p)), (e) => e.child(Button("prs-worktree-rm", { label: "Remove worktree", size: "sm", variant: "ghost", onClick: (_e, cx) => this.worktree(cx, p, true) })))
@@ -798,6 +916,17 @@ export default class Prs {
                   .gap(12)
                   .child(h_flex().flex_none().gap(8).items_center().child(Button("prs-back", { label: sel.title, icon: "chevron-left", variant: "ghost", size: "sm", onClick: (_e, cx) => ((this.view = null), cx.notify()) })).child(div().text_size(TEXT.sm).font_semibold().child("Files changed")))
                   .child(this.pfiles.render(k, sel, this.drafts, this.cfg))
+            : sel && this.view === "quiz"
+              ? v_flex()
+                  .id("prs-quiz-scroll")
+                  .flex_1()
+                  .min_h(0)
+                  .overflow_y_scrollbar()
+                  .px(24)
+                  .py(16)
+                  .gap(12)
+                  .child(h_flex().gap(8).items_center().child(Button("prs-back", { label: sel.title, icon: "chevron-left", variant: "ghost", size: "sm", onClick: (_e, cx) => ((this.view = null), cx.notify()) })).child(div().text_size(TEXT.sm).font_semibold().child("Quiz")))
+                  .child(this.quizPage(k, sel))
             : sel && this.view === "explain"
               ? v_flex()
                   .id("prs-explain-scroll")
@@ -827,11 +956,13 @@ export default class Prs {
         const dp = this.drafts.confirm.p;
         const de = this.drafts.m.get(keyOf(dp));
         const n = de?.exists ? this.drafts.counts(de) : { lines: 0, replies: 0 };
+        const qs = this.quizScore(dp);
+        const quizNote = !qs ? " You have not taken the quiz on it (Quiz me)." : qs.answered < qs.total ? ` Quiz: ${qs.answered} of ${qs.total} answered.` : ` Quiz: ${qs.right} of ${qs.total} right.`;
         const verb = de?.verdict === "APPROVE" ? "an approval" : de?.verdict === "REQUEST_CHANGES" ? "a request for changes" : "a review";
         return e.child(
           AlertDialog("prs-post", {
             title: this.drafts.confirm.pending ? `Keep the draft on GitHub as pending on ${dp.repo.split("/")[1]}#${dp.number}?` : `Post ${verb} on ${dp.repo.split("/")[1]}#${dp.number}?`,
-            description: this.drafts.confirm.pending ? `${n.lines} line comment${n.lines === 1 ? "" : "s"} are saved on GitHub as a pending review. Only you see it, in VS Code's pull request view and on the PR page, until you submit it. Nothing is published.` : `${n.lines} line comment${n.lines === 1 ? "" : "s"} and ${n.replies} repl${n.replies === 1 ? "y" : "ies"} go to GitHub under your name, visible to everyone on the pull request.`,
+            description: this.drafts.confirm.pending ? `${n.lines} line comment${n.lines === 1 ? "" : "s"} are saved on GitHub as a pending review. Only you see it, in VS Code's pull request view and on the PR page, until you submit it. Nothing is published.` : `${n.lines} line comment${n.lines === 1 ? "" : "s"} and ${n.replies} repl${n.replies === 1 ? "y" : "ies"} go to GitHub under your name, visible to everyone on the pull request.${quizNote}`,
             confirmLabel: this.drafts.confirm.pending ? "Keep as pending" : "Post review",
             onCancel: (_e, cx) => ((this.drafts.confirm = null), cx.notify()),
             onConfirm: (_e, cx) => this.drafts.post(cx, dp, (cx) => this.readConvo(cx, dp), Boolean(this.drafts.confirm.pending)),

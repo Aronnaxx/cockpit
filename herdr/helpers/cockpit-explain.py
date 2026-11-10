@@ -2,12 +2,21 @@
 """
 cockpit-explain.py pr <owner/name> <number> <model>
 cockpit-explain.py why <owner/name> <number> <comment index> <model>
+cockpit-explain.py fill <owner/name> <number>
+cockpit-explain.py quiz <owner/name> <number> <model>
 Explanations written by a model of the LiteLLM gateway (cockpit_gateway.py); nothing is written to GitHub.
 
 pr: what the pull request does and how it differs from its base, for a reader who did not write it: a headline, a summary,
 before/after by aspect, a diagram of the flow it changes (plain text art), the areas it touches (with their files) and what to
 watch. Kept in ~/.cache/cockpit/explain/<owner>__<name>__<number>.json with the head it was written for, and printed. The
 lines changed per area are counted here from the diff, never by the model.
+
+fill: an explanation a reviewing agent wrote itself (the cockpit-pr-review skill): its lines per area, its files and the head
+it was written for, counted here from the diff, as `pr` adds them.
+
+quiz: questions that check the person understands the change before they put their name on a review: what it does, how it
+behaves, and whether the draft's comments (the agent's) hold up. Multiple choice, each with the answer and why; kept in
+~/.cache/cockpit/quiz/<owner>__<name>__<number>.json with the head, and printed.
 
 why: why a comment of the review draft (~/.cache/cockpit/review-drafts/...) was made: from the code it is on, the PR's diff of
 that file, and what the agent that wrote the draft said and did while reviewing (its session transcript, found by the draft's
@@ -17,6 +26,7 @@ file name: Claude Code and OpenCode sessions on this machine). Prints {text, sou
 import glob
 import json
 import os
+import random
 import re
 import sqlite3
 import subprocess
@@ -81,15 +91,8 @@ Answer with one JSON object:
 - watch: up to four things a reader of this change signs up for (a new dependency, a behaviour that changed for existing callers, a limit, something untested), one sentence each; empty if none."""
 
 
-def explain_pr(slug, number, model):
-    meta = json.loads(gh("pr", "view", str(number), "-R", slug, "--json", "title,body,headRefOid,baseRefName,headRefName,author"))
-    diff = gh("pr", "diff", str(number), "-R", slug, timeout=120)
-    stats = file_stats(diff)
-    body = (meta.get("body") or "")[:6000]
-    prompt = f"Pull request {slug}#{number}: {meta['title']}\nBy {meta.get('author', {}).get('login')}, {meta['headRefName']} into {meta['baseRefName']}.\n\nDescription:\n{body or '(none)'}\n\nFiles (+added -removed):\n" + "\n".join(f"{p} +{a} -{r}" for p, (a, r) in stats.items()) + f"\n\nThe diff:\n{diff[:160000]}" + ("\n(the diff is cut here)" if len(diff) > 160000 else "")
-    text, _ = cockpit_gateway.ask(model, [{"role": "system", "content": PR_SYSTEM + "\n\nThe JSON schema:\n" + json.dumps(PR_SCHEMA)}, {"role": "user", "content": prompt}], max_tokens=16000, schema=PR_SCHEMA)
-    d = cockpit_gateway.as_json(text)
-    # The lines per area, counted from the diff; files the model left out go under "Other".
+def counted(d, stats):
+    """The lines added and removed per area, from the diff; files no area names go under "Other"."""
     seen = set()
     for a in d.get("areas") or []:
         a["files"] = [f for f in a.get("files") or [] if f in stats]
@@ -99,13 +102,41 @@ def explain_pr(slug, number, model):
     rest = [f for f in stats if f not in seen]
     if rest:
         d.setdefault("areas", []).append({"name": "Other", "what": "Files no area above names.", "files": rest, "added": sum(stats[f][0] for f in rest), "removed": sum(stats[f][1] for f in rest)})
-    d.update(model=model, head=meta["headRefOid"], at=int(time.time() * 1000), files=len(stats), added=sum(a for a, _ in stats.values()), removed=sum(r for _, r in stats.values()))
+    d.update(files=len(stats), added=sum(a for a, _ in stats.values()), removed=sum(r for _, r in stats.values()))
+    return d
+
+
+def save(slug, number, d):
     os.makedirs(CACHE, exist_ok=True)
     path = os.path.join(CACHE, f"{slug.replace('/', '__')}__{number}.json")
     with open(path + ".tmp", "w") as f:
         json.dump(d, f)
     os.replace(path + ".tmp", path)
     return d
+
+
+def fill(slug, number):
+    path = os.path.join(CACHE, f"{slug.replace('/', '__')}__{number}.json")
+    d = json.load(open(path))
+    if d.get("files") is not None and d.get("head"):
+        return d
+    head = json.loads(gh("pr", "view", str(number), "-R", slug, "--json", "headRefOid"))["headRefOid"]
+    counted(d, file_stats(gh("pr", "diff", str(number), "-R", slug, timeout=120)))
+    d.update(head=d.get("head") or head, at=d.get("at") or int(os.path.getmtime(path) * 1000), model=d.get("model") or "the reviewing agent", by_agent=True)
+    return save(slug, number, d)
+
+
+def explain_pr(slug, number, model):
+    meta = json.loads(gh("pr", "view", str(number), "-R", slug, "--json", "title,body,headRefOid,baseRefName,headRefName,author"))
+    diff = gh("pr", "diff", str(number), "-R", slug, timeout=120)
+    stats = file_stats(diff)
+    body = (meta.get("body") or "")[:6000]
+    prompt = f"Pull request {slug}#{number}: {meta['title']}\nBy {meta.get('author', {}).get('login')}, {meta['headRefName']} into {meta['baseRefName']}.\n\nDescription:\n{body or '(none)'}\n\nFiles (+added -removed):\n" + "\n".join(f"{p} +{a} -{r}" for p, (a, r) in stats.items()) + f"\n\nThe diff:\n{diff[:160000]}" + ("\n(the diff is cut here)" if len(diff) > 160000 else "")
+    text, _ = cockpit_gateway.ask(model, [{"role": "system", "content": PR_SYSTEM + "\n\nThe JSON schema:\n" + json.dumps(PR_SCHEMA)}, {"role": "user", "content": prompt}], max_tokens=16000, schema=PR_SCHEMA)
+    d = cockpit_gateway.as_json(text)
+    counted(d, stats)
+    d.update(model=model, head=meta["headRefOid"], at=int(time.time() * 1000))
+    return save(slug, number, d)
 
 
 def transcripts(name, about):
@@ -191,12 +222,74 @@ def explain_why(slug, number, index, model):
     text, _ = cockpit_gateway.ask(model, [{"role": "system", "content": system}, {"role": "user", "content": prompt}], max_tokens=6000)
     return {"text": text, "sources": [label for label, _ in sessions], "model": model}
 
+QUIZ_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["questions"],
+    "properties": {"questions": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+        "required": ["about", "comment", "question", "choices", "answer", "explain"],
+        "properties": {
+            "about": {"enum": ["behaviour", "design", "risk", "comment"]},
+            "comment": {"type": "integer"},
+            "question": {"type": "string"},
+            "choices": {"type": "array", "items": {"type": "string"}},
+            "answer": {"type": "integer"},
+            "explain": {"type": "string"}}}}},
+}
+
+QUIZ_SYSTEM = """You write a short quiz for an engineer who is about to put their name on a code review of a pull request, much of it drafted by an AI agent. The quiz checks that they understand the change themselves rather than passing on what the agent said. Ask about the code, never trivia (no "how many files", no names to memorise).
+
+Write 6 to 8 questions, multiple choice, four choices each, one right:
+- 3 or 4 on the change itself ("behaviour": what happens now in a concrete case, before vs after; "design": why it is built this way or what it trades off; "risk": what could break and for whom). Use concrete inputs and situations from the code.
+- 2 to 4 on the draft's comments ("comment", with "comment" set to the comment's index as given): does the comment's claim hold, what in the code makes it so, or what the right fix is. When a comment is wrong or overstated, the right answer says so. Do not leak the answer in the question.
+For other questions "comment" is -1. "answer" is the index (0-3) of the right choice; place it at varying positions. Make the wrong choices plausible to someone who only skimmed. "explain": two or three sentences on why the answer is right, pointing at the code (file and line)."""
+
+
+def quiz(slug, number, model):
+    meta = json.loads(gh("pr", "view", str(number), "-R", slug, "--json", "title,body,headRefOid"))
+    diff = gh("pr", "diff", str(number), "-R", slug, timeout=120)
+    name = f"{slug.replace('/', '__')}__{number}.json"
+    try:
+        draft = json.load(open(os.path.join(DRAFTS, name)))
+    except Exception:
+        draft = {}
+    comments = [(i, c) for i, c in enumerate(draft.get("comments") or []) if c.get("path") and str(c.get("body", "")).strip()]
+    listed = "\n\n".join(f"[{i}] {c['path']} line {c.get('start_line') or c.get('line')}{'-' + str(c['line']) if c.get('start_line') else ''}:\n{c['body']}" for i, c in comments)
+    prompt = f"Pull request {slug}#{number}: {meta['title']}\n\n{(meta.get('body') or '')[:4000]}\n\nThe draft's comments:\n{listed or '(none: ask only about the change)'}\n\nThe diff:\n{diff[:150000]}"
+    text, _ = cockpit_gateway.ask(model, [{"role": "system", "content": QUIZ_SYSTEM + "\n\nThe JSON schema:\n" + json.dumps(QUIZ_SCHEMA)}, {"role": "user", "content": prompt}], max_tokens=12000, schema=QUIZ_SCHEMA)
+    d = cockpit_gateway.as_json(text)
+    by = dict(comments)
+    qs = []
+    for q in d.get("questions") or []:
+        if len(q.get("choices") or []) < 2 or not 0 <= int(q.get("answer", -1)) < len(q["choices"]):
+            continue
+        # Models put the right answer in the same place: shuffled here, the answer moved with it.
+        order = list(range(len(q["choices"])))
+        random.shuffle(order)
+        q["answer"] = order.index(int(q["answer"]))
+        q["choices"] = [q["choices"][j] for j in order]
+        c = by.get(int(q.get("comment", -1)))
+        if q.get("about") == "comment" and c:
+            q["path"], q["line"], q["start_line"] = c["path"], c.get("line"), c.get("start_line")
+        qs.append(q)
+    out = {"questions": qs, "model": model, "head": meta["headRefOid"], "at": int(time.time() * 1000)}
+    folder = os.path.expanduser("~/.cache/cockpit/quiz")
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, name + ".tmp"), "w") as f:
+        json.dump(out, f)
+    os.replace(os.path.join(folder, name + ".tmp"), os.path.join(folder, name))
+    return out
+
 
 def main():
     a = sys.argv[1:]
     try:
         if len(a) >= 4 and a[0] == "pr":
             print(json.dumps(explain_pr(a[1], a[2], a[3])))
+        elif len(a) >= 3 and a[0] == "fill":
+            print(json.dumps(fill(a[1], a[2])))
+        elif len(a) >= 4 and a[0] == "quiz":
+            print(json.dumps(quiz(a[1], a[2], a[3])))
         elif len(a) >= 5 and a[0] == "why":
             print(json.dumps(explain_why(a[1], a[2], a[3], a[4])))
         else:
