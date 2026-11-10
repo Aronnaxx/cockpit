@@ -7,6 +7,7 @@ import { h_flex, v_flex, InputState, TextareaState, Textarea, Input, TextView } 
 import { exec, notify, readTextFile, writeTextFile } from "herdr";
 import * as hub from "./hub.js";
 import { tokens, alpha, TEXT, RADIUS, Badge, Button, Tabs, Mono } from "./ui.js";
+import { CodeBlock, makeCode } from "./codeblock.js";
 
 const keyOf = (p) => `${p.repo}#${p.number}`;
 export const draftFile = (home, p) => `${home}/.cache/cockpit/review-drafts/${p.repo.replace("/", "__")}__${p.number}.json`;
@@ -21,6 +22,8 @@ export class Drafts {
     this.n = 0;
     // The pull request's files at its head (for the lines a comment is about): `repo#n:path` -> lines, or "loading".
     this.files = new Map();
+    // The highlighted lines of a comment: `repo#n:path:line` -> a code view (made in tasks, never in render).
+    this.cbs = new Map();
   }
 
   /** Reads the draft file; true when what it shows changed (an agent wrote it, or the first read). */
@@ -48,6 +51,7 @@ export class Drafts {
     entry.summary = this.area(d.summary ?? "", "The review's summary: what you'd say when you submit it", 3, changed);
     entry.rows = (d.comments ?? []).map((c) => this.row(c, changed));
     for (const c of d.comments ?? []) if (c.path) this.ensureFile(cx, p, c.path);
+    cx.timer.after(1, () => this.buildSnippets());
     this.m.set(keyOf(p), entry);
     return true;
   }
@@ -70,6 +74,7 @@ export class Drafts {
         const { home } = await hub.install();
         const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-pr-file.py`, p.repo, String(p.number), path], { timeout: 90000 });
         this.files.set(key, JSON.parse(r.stdout || "{}").files?.[path] ?? null);
+        this.buildSnippets();
       } catch {
         this.files.set(key, null);
       }
@@ -77,16 +82,32 @@ export class Drafts {
     });
   }
 
+  /** Makes the highlighted view for every draft comment whose file is read and whose lines have none yet. */
+  buildSnippets() {
+    for (const e of this.m.values()) {
+      if (!e.exists) continue;
+      for (const r of e.rows) {
+        const path = r.path.value().trim(), n = Number(r.line.value());
+        const lines = this.files.get(`${keyOf(e.p)}:${path}`);
+        const key = `${keyOf(e.p)}:${path}:${n}`;
+        if (r.reply_to || !Array.isArray(lines) || !n || n > lines.length || this.cbs.has(key)) continue;
+        const from = Math.max(1, n - 3), to = Math.min(lines.length, n + 3);
+        try {
+          this.cbs.set(key, { cb: makeCode(lines.slice(from - 1, to), path), from, to, n });
+        } catch {
+          this.cbs.set(key, null);
+        }
+      }
+    }
+  }
+
   /** The lines a comment is on, with the line numbers, the commented one marked; nothing until the file is read. */
   snippet(k, p, path, line) {
-    const lines = this.files.get(`${keyOf(p)}:${path}`);
-    const n = Number(line);
-    if (!Array.isArray(lines) || !n || n > lines.length) return null;
-    const from = Math.max(1, n - 3), to = Math.min(lines.length, n + 3);
-    const rows = [];
-    for (let i = from; i <= to; i++)
-      rows.push(h_flex().id(`sn-${path}-${i}`).gap(10).px(8).bg(i === n ? alpha(k.warning, 0.18) : alpha(k.muted, 0)).child(div().w(36).flex_none().text_right().text_size(10.5).font_family("JetBrains Mono").text_color(k.dim).child(String(i))).child(div().text_size(10.5).font_family("JetBrains Mono").whitespace_nowrap().text_color(i === n ? k.foreground : k.mutedFg).child(lines[i - 1] || " ")));
-    return v_flex().w_full().py(4).rounded(RADIUS.sm).bg(alpha(k.muted, 0.7)).overflow_x_scrollbar().children(rows);
+    const v = this.cbs.get(`${keyOf(p)}:${path}:${Number(line)}`);
+    if (!v) return null;
+    const gutter = [];
+    for (let i = v.from; i <= v.to; i++) gutter.push(String(i));
+    return CodeBlock(`sn-${path}-${v.n}`, v.cb, { gutter, marks: { [v.n - v.from]: k.warning } });
   }
 
   md(id, text) {
@@ -124,6 +145,7 @@ export class Drafts {
     cx.timer.after(500, () => {
       if (e.version !== mine) return;
       for (const r of e.rows) { const path = r.path.value().trim(); if (path && !r.reply_to) this.ensureFile(cx, e.p, path); }
+      this.buildSnippets();
       e.chain = e.chain.then(() => this.save(e)).catch(() => {});
     });
   }

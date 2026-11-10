@@ -11,6 +11,7 @@ import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mo
 import { loadPrs, prs, prsConfig, ago } from "./prsdata.js";
 import { urgent, urgency } from "./prcards.js";
 import { Drafts } from "./prreview.js";
+import { CodeBlock, makeCode } from "./codeblock.js";
 import { LAUNCH_AGENTS, launchAgent, lastAgent, prPrompt, repoFolder } from "./agentlaunch.js";
 import { OmoModel } from "./agentsui.js";
 
@@ -134,7 +135,18 @@ export default class Prs {
       try {
         const { home } = await hub.install();
         const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-pr-comments.py`, p.repo, String(p.number)], { timeout: 90000 });
-        this.convo.set(keyOf(p), JSON.parse(r.stdout || "null") ?? { error: "no answer", items: [] });
+        const d = JSON.parse(r.stdout || "null") ?? { error: "no answer", items: [] };
+        // The diff around each line comment, in the file's language: +/- in a gutter, the code highlighted.
+        for (const it of d.items ?? []) {
+          if (it.kind !== "thread" || !it.hunk) continue;
+          const rows = it.hunk.split("\n").filter((l) => !l.startsWith("@@")).slice(-10);
+          it.kinds = rows.map((l) => l[0] ?? " ");
+          it.gutter = it.kinds.map((c) => (c === "+" || c === "-" ? c : ""));
+          try {
+            it.cb = makeCode(rows.map((l) => l.slice(1)), it.path);
+          } catch {}
+        }
+        this.convo.set(keyOf(p), d);
       } catch (e) {
         this.convo.set(keyOf(p), { error: String(e?.message ?? e).slice(0, 160), items: [] });
       }
@@ -309,7 +321,7 @@ export default class Prs {
           )
           .when(open, (e) =>
             e
-              .when(Boolean(it.hunk), (x) => x.child(v_flex().p(6).rounded(RADIUS.sm).bg(alpha(k.muted, 0.7)).children(it.hunk.split("\n").slice(-10).map((l, j) => div().id(`${id}-h${j}`).text_size(10.5).font_family("JetBrains Mono").whitespace_nowrap().text_color(l.startsWith("+") ? k.success : l.startsWith("-") ? k.destructive : k.mutedFg).child(l || " ")))))
+              .when(Boolean(it.cb), (x) => x.child(CodeBlock(`${id}-code`, it.cb, { gutter: it.gutter, marks: Object.fromEntries(it.kinds.map((c, j) => [j, c === "+" ? k.success : c === "-" ? k.destructive : null]).filter(([, v]) => v)) })))
               .children(it.comments.map((cm, j) => v_flex().id(`${id}-c${j}`).gap(4).child(head(cm.author, "commented", cm.at)).child(body(cm.body)))),
           );
       }
