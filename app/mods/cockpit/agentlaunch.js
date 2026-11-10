@@ -50,9 +50,16 @@ export async function launchAgent({ agent, prompt, folder, name, model = null, r
     localStorage.setItem("cockpit.launch.agent", agent);
   } catch {}
   const { home } = await hub.install();
-  const args = ["agent", "argv", "start", "--agent", agent, "--prompt", prompt, ...(model ? ["--model", model] : [])];
+  // OpenCode's interactive command has no model flag (only `opencode run` does): the model goes in the folder's project config.
+  const viaEnv = agent === "opencode" && model;
+  const args = ["agent", "argv", "start", "--agent", agent, "--prompt", prompt, ...(model && !viaEnv ? ["--model", model] : [])];
   const r = await exec(`${home}/.local/bin/cockpit`, args, { timeout: 15000 }).catch((e) => ({ stdout: "", stderr: String(e?.message ?? e) }));
-  const line = String(r.stdout ?? "").trim();
+  let line = String(r.stdout ?? "").trim();
+  if (line && viaEnv) {
+    const w = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-opencode-model.py`, folder?.replace(/^~/, home) ?? home, model], { timeout: 15000 }).catch(() => null);
+    const res = w ? JSON.parse(w.stdout || "{}") : {};
+    if (res.error) notify({ title: "OpenCode keeps its own model here", body: res.error });
+  }
   if (!line) {
     notify({ title: "Could not start the agent", body: String(r.stderr ?? "").trim().slice(0, 160) || `${agent} has no way to start with a prompt` });
     return false;

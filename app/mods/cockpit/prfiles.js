@@ -191,7 +191,7 @@ export class PrFiles {
     } else {
       const built = this.built.get(`${keyOf(p)}:${file.path}`) ?? [];
       body = built.length
-        ? v_flex().gap(8).children(built.flatMap(({ hunk, code }, i) => [div().id(`pf-h-${i}`).px(8).py(3).rounded(RADIUS.sm).bg(alpha(k.info, 0.1)).text_size(TEXT.xs).font_family("JetBrains Mono").text_color(k.info).child(hunk.header), DiffBlock(`pf-d-${file.path}-${i}`, code, hunk.rows, { onLine: addAt(file.path), marked: new Set(pending(file.path).map((r) => Number(r.line.value()))) })]))
+        ? v_flex().gap(8).children(built.flatMap(({ hunk, code }, i) => [h_flex().id(`pf-h-${i}`).gap(8).items_center().px(8).py(2).rounded(RADIUS.sm).bg(alpha(k.info, 0.1)).child(div().flex_1().min_w(0).truncate().text_size(TEXT.xs).font_family("JetBrains Mono").text_color(k.info).child(hunk.header)).child(Button(`pf-hv-${i}`, { label: "VS Code", size: "sm", variant: "ghost", tooltip: "This hunk in VS Code, in the PR's worktree", onClick: (_e, cx) => this.inEditor(cx, p, cfg, file.path, hunk.rows.find((r) => r.new)?.new ?? 1) })).child(Button(`pf-hg-${i}`, { label: "GitHub", size: "sm", variant: "ghost", tooltip: "This hunk on GitHub", onClick: (_e, cx) => this.onGithub(cx, p, file.path, hunk.rows.find((r) => r.new)?.new ?? null) })), DiffBlock(`pf-d-${file.path}-${i}`, code, hunk.rows, { onLine: addAt(file.path), marked: new Set(pending(file.path).map((r) => Number(r.line.value()))) })]))
         : div().text_size(TEXT.sm).text_color(k.dim).child(`${file.status === "renamed" ? "Renamed" : "No text diff"} (a binary file, or one too large to show here). Use “Full file”.`);
     }
     const mine = file ? pending(file.path) : [];
