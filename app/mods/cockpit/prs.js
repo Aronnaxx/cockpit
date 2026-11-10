@@ -7,7 +7,7 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState } from "gpui-base";
 import { exec, notify, run, shared } from "herdr";
 import * as hub from "./hub.js";
-import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mono, Progress, Spinner, TextField, Tabs, Chip } from "./ui.js";
+import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mono, Progress, Spinner, TextField, Tabs, Chip, AlertDialog } from "./ui.js";
 import { loadPrs, prs, prsConfig, ago } from "./prsdata.js";
 import { urgent, urgency } from "./prcards.js";
 import { LAUNCH_AGENTS, launchAgent, lastAgent, prPrompt, repoFolder } from "./agentlaunch.js";
@@ -47,6 +47,7 @@ export default class Prs {
     this.convo = new Map();
     this.openThreads = new Set();
     this.worktrees = new Set();
+    this.confirm = null;
     this.trees = [];
     this.loadTrees(cx);
     this.omo = new OmoModel();
@@ -100,6 +101,22 @@ export default class Prs {
       } catch (e) {
         this.convo.set(keyOf(p), { error: String(e?.message ?? e).slice(0, 160), items: [] });
       }
+      cx.notify();
+    });
+  }
+
+  /** Marks the pull request ready for review or back to a draft; closes it. All through gh, after a confirmation for a close. */
+  changeState(cx, p, what) {
+    cx.spawn(async (cx) => {
+      const args = what === "close" ? ["pr", "close", String(p.number), "-R", p.repo] : ["pr", "ready", String(p.number), "-R", p.repo, ...(what === "draft" ? ["--undo"] : [])];
+      try {
+        await exec("/opt/homebrew/bin/gh", args, { timeout: 60000 });
+        notify({ title: what === "close" ? "Pull request closed" : what === "draft" ? "Back to a draft" : "Ready for review", body: keyOf(p) });
+      } catch (e) {
+        notify({ title: "Could not change the pull request", body: String(e?.message ?? e).slice(0, 160) });
+      }
+      this.confirm = null;
+      await loadPrs({ force: true });
       cx.notify();
     });
   }
@@ -218,7 +235,7 @@ export default class Prs {
     const c = this.convo.get(keyOf(p));
     const head = (author, what, at, extra) =>
       h_flex().gap(8).items_center().child(div().size(20).flex_none().rounded(10).flex().items_center().justify_center().bg(alpha(k.info, 0.18)).text_size(10).font_semibold().text_color(k.info).child(author.slice(0, 2).toUpperCase())).child(div().text_size(TEXT.sm).font_semibold().text_color(k.foreground).child(author)).child(div().text_size(TEXT.xs).text_color(k.dim).child(`${what} ${ago(at)} ago`)).child(div().flex_1()).children([extra].filter(Boolean));
-    const body = (text) => (text ? div().text_size(TEXT.sm).text_color(k.foreground).whitespace_normal().child(text.length > 1600 ? `${text.slice(0, 1600)}…` : text) : null);
+    const body = (text) => (text ? div().text_size(TEXT.sm).text_color(k.foreground).whitespace_normal().child(text.length > 1600 ? `${text.slice(0, 1600)}…` : text) : div());
     const chip = (label, color) => div().flex_none().px(6).h(16).flex().items_center().rounded(4).text_size(10).bg(alpha(color, 0.14)).text_color(color).child(label);
     if (!c || c === "loading") return h_flex().gap(8).items_center().text_color(k.mutedFg).child(Spinner({ size: 12 })).child("Reading the conversation…");
     const items = (c.items ?? []).map((it, i) => {
@@ -359,7 +376,12 @@ export default class Prs {
               .pt(4)
               .child(Button("prs-open", { label: "Open PR", icon: "external", size: "sm", variant: "outline", onClick: (_e, cx) => cx.spawn(async () => hub.openUrl(p.url)) }))
               .child(Button("prs-worktree", { label: this.worktrees.has(keyOf(p)) ? "Open worktree" : "Explore in a worktree", icon: "git-branch", size: "sm", variant: "outline", tooltip: "A git worktree of this pull request's head in ~/worktrees, opened in a new tab; your own checkout is not touched", onClick: (_e, cx) => this.worktree(cx, p) }))
-              .when(this.worktrees.has(keyOf(p)), (e) => e.child(Button("prs-worktree-rm", { label: "Remove worktree", size: "sm", variant: "ghost", onClick: (_e, cx) => this.worktree(cx, p, true) }))),
+              .when(this.worktrees.has(keyOf(p)), (e) => e.child(Button("prs-worktree-rm", { label: "Remove worktree", size: "sm", variant: "ghost", onClick: (_e, cx) => this.worktree(cx, p, true) })))
+              .when(p.role === "author", (e) =>
+                e
+                  .child(Button("prs-draft", { label: p.draft ? "Mark ready for review" : "Convert to draft", icon: "file-text", size: "sm", variant: "outline", onClick: (_e, cx) => this.changeState(cx, p, p.draft ? "ready" : "draft") }))
+                  .child(Button("prs-close", { label: "Close PR", size: "sm", variant: "ghost", onClick: (_e, cx) => ((this.confirm = { p }), cx.notify()) })),
+              ),
           ),
       )
       .child(
@@ -468,6 +490,7 @@ export default class Prs {
     const yours = list.filter((p) => p.turn?.who === "you").length;
     return v_flex()
       .id("prs")
+      .relative()
       .size_full()
       .bg(k.background)
       .text_color(k.foreground)
@@ -494,6 +517,18 @@ export default class Prs {
                 .py(16)
                 .child(v_flex().id("prs-list").w(380).flex_none().min_h(0).gap(10).overflow_y_scrollbar().children([filters, group("Your pull requests", mine), group("Waiting for your review", theirs)].filter(Boolean)))
                 .child(v_flex().id("prs-detail-scroll").flex_1().min_w(0).min_h(0).overflow_y_scrollbar().child(this.scope === "trees" ? this.treesView(k) : sel ? this.detail(k, sel, cx) : Empty({ icon: "git-pull-request", title: "Pick a pull request", description: "Its reviewers, CI and an agent to work on it show here." }))),
+      )
+      .when(Boolean(this.confirm), (e) =>
+        e.child(
+          AlertDialog("prs-confirm", {
+            title: `Close ${this.confirm.p.repo.split("/")[1]}#${this.confirm.p.number}?`,
+            description: `“${this.confirm.p.title}” is closed on GitHub. It can be reopened there.`,
+            confirmLabel: "Close pull request",
+            destructive: true,
+            onCancel: (_e, cx) => ((this.confirm = null), cx.notify()),
+            onConfirm: (_e, cx) => this.changeState(cx, this.confirm.p, "close"),
+          }),
+        ),
       );
   }
 }

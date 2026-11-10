@@ -109,7 +109,7 @@ export function QuotaBars(quota, { id = "quota", compact = false, labelW = 18, r
     .children(
       quota.map((q) => {
         const p = Math.max(0, Math.min(100, q.percent ?? 0));
-        const tone = p >= 95 ? k.destructive : p >= 80 || q.ahead ? k.warning : k.success;
+        const tone = p >= 90 ? k.destructive : p >= 75 || q.ahead ? k.warning : k.success;
         const left = q.resets_at ? dur(q.resets_at - Date.now()) : null;
         // Nothing used and no reset yet: the window starts with the next request.
         const idle = !q.resets_at && !q.percent;
@@ -140,7 +140,7 @@ export function QuotaBars(quota, { id = "quota", compact = false, labelW = 18, r
               .gap(2)
               .text_size(TEXT.xs)
               .font_family("JetBrains Mono")
-              .text_color(q.ahead || p >= 80 ? tone : k.mutedFg)
+              .text_color(q.ahead || p >= 75 ? tone : k.mutedFg)
               .when(Boolean(q.ahead), (e) => e.child("▲"))
               .child(q.percent == null ? "–" : `${p}%`),
           )

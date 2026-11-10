@@ -710,7 +710,7 @@ export default class Home {
       .gap(18)
       .when(Boolean(this.nextMove(cols, narrow)), (e) => e.child(this.nextMove(cols, narrow)))
       .child(this.board(cols, wide, narrow))
-      .child(prs() ? PrSections(prs(), { cardBox: this.cardBox(narrow), show, openUrl: (cx, u) => this.openUrl(cx, u) }) : cols.prs.length > 0 ? this.prList(cols.prs, narrow) : null);
+      .child(prs() ? PrSections(prs(), { narrow, show, openUrl: (cx, u) => this.openUrl(cx, u) }) : cols.prs.length > 0 ? this.prList(cols.prs, narrow) : null);
     const right = v_flex()
       .w(320)
       .flex_none()

@@ -59,7 +59,7 @@ export function worst(windows) {
 /** The sidebar badge: the worst window when it is at 80% or more. */
 export function usageBadge(data) {
   const p = Math.round(worst((data?.agents ?? []).flatMap((a) => a.windows ?? [])));
-  return p >= 80 ? { count: `${p}%`, tone: p >= 95 ? "destructive" : "warning" } : null;
+  return p >= 75 ? { count: `${p}%`, tone: p >= 90 ? "destructive" : "warning" } : null;
 }
 
 /** The bar's colour as Claude Code's own status line has it: green, amber from 75% (or when ahead of pace), red from 90%. */
