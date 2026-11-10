@@ -28,8 +28,9 @@ export const APPS = {
   usage: { label: "Usage", icon: "gauge", key: "⌘⌥8" },
   machines: { label: "Machines", icon: "layers", key: "⌘⌥9" },
   prs: { label: "Pull requests", icon: "git-pull-request", key: "⌘⌥P" },
+  worktrees: { label: "Worktrees", icon: "git-fork", key: "⌘⌥W" },
 };
-export const DEFAULT_SPACES = ["inbox", "terminal", "actions", "to-do", "runbook", "meetings", "usage", "machines", "prs"];
+export const DEFAULT_SPACES = ["inbox", "terminal", "actions", "to-do", "runbook", "meetings", "usage", "machines", "prs", "worktrees"];
 
 /** An app's bubble from its view: what waits on you there, {count, tone} or null. */
 function appBadge(app, v) {

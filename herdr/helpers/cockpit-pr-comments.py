@@ -17,7 +17,7 @@ query($owner: String!, $name: String!, $number: Int!) {
     comments(first: 100) { nodes { author { login } body createdAt url } }
     reviews(first: 100) { nodes { author { login } state body submittedAt url } }
     reviewThreads(first: 100) { nodes { isResolved isOutdated path line originalLine diffSide
-      comments(first: 50) { nodes { author { login } body createdAt url diffHunk } } } }
+      comments(first: 50) { nodes { databaseId author { login } body createdAt url diffHunk } } } }
   } }
 }
 """
@@ -50,7 +50,7 @@ def main():
             continue
         items.append({
             "kind": "thread", "path": t["path"], "line": t["line"] or t["originalLine"], "resolved": t["isResolved"], "outdated": t["isOutdated"], "at": ms(cs[0]["createdAt"]),
-            "hunk": (cs[0].get("diffHunk") or "")[-900:], "author": (cs[0]["author"] or {}).get("login", "ghost"), "url": cs[0]["url"],
+            "hunk": (cs[0].get("diffHunk") or "")[-900:], "reply_id": cs[0].get("databaseId"), "author": (cs[0]["author"] or {}).get("login", "ghost"), "url": cs[0]["url"],
             "comments": [{"author": (c["author"] or {}).get("login", "ghost"), "at": ms(c["createdAt"]), "body": c["body"]} for c in cs],
         })
     items.sort(key=lambda x: x["at"])

@@ -123,27 +123,23 @@ export function PrCard(p, { show, openUrl }) {
     .child(h_flex().gap(8).flex_wrap().children(actions));
 }
 
-/** The pull requests that need you, mine then to review, in a grid of equal cells; the rest wait on others (the PRs page has them). */
+/** The critical pull requests (red: changes asked, CI failing, far behind main) in a grid of equal cells; the PRs tab has the rest. */
 export function PrSections(d, { narrow, show, openUrl }) {
   const k = tokens();
-  const order = (a, b) => (urgency(b) - urgency(a)) || (b.turn?.who === "you") - (a.turn?.who === "you") || b.last_activity - a.last_activity;
-  const needs = (p) => p.turn?.who === "you" || urgency(p) > 0;
-  const mineAll = d?.mine ?? [];
-  const theirsAll = (d?.assigned ?? []).filter((p) => p.turn?.who !== "none");
-  const mine = mineAll.filter(needs).sort(order);
-  const theirs = theirsAll.filter((p) => p.turn?.who === "you").sort(order);
+  const order = (a, b) => b.last_activity - a.last_activity;
+  const all = [...(d?.mine ?? []), ...(d?.assigned ?? [])];
+  const critical = (d?.mine ?? []).filter((p) => urgency(p) === 2).sort(order);
+  const onYou = all.filter((p) => p.turn?.who === "you").length;
   const cols = narrow ? 1 : 2;
-  const grid = (items) => {
-    const rows = [];
-    for (let i = 0; i < items.length; i += cols) rows.push(items.slice(i, i + cols));
-    return v_flex().w_full().gap(14).children(rows.map((r, i) => h_flex().id(`pr-row-${i}-${prKey(r[0])}`).w_full().gap(14).items_stretch().children([...r.map((p) => div().flex_1().min_w(0).flex().child(PrCard(p, { show, openUrl }))), ...Array.from({ length: cols - r.length }, (_, j) => div().id(`pr-pad-${i}-${j}`).flex_1().min_w(0))])));
-  };
-  const more = (n, label) => (n > 0 ? h_flex().id(`pr-more-${label}`).gap(6).items_center().cursor_pointer().text_size(TEXT.sm).text_color(k.mutedFg).hover((s) => s.text_color(k.foreground)).on_click(() => show("prs")).child(`${n} more ${label} →`) : null);
-  const section = (id, label, color, items, rest, restLabel) =>
-    items.length || rest > 0
-      ? v_flex().gap(10).child(StageHeading(id, label, { color, count: items.length })).children([items.length ? grid(items) : div().text_size(TEXT.sm).text_color(k.dim).child("Nothing needs you here."), more(rest, restLabel)].filter(Boolean))
-      : null;
+  const rows = [];
+  for (let i = 0; i < critical.length; i += cols) rows.push(critical.slice(i, i + cols));
+  const open = Button("prs-open-tab", { label: `Open PRs · ${onYou} on you`, variant: "ghost", size: "sm", tooltip: "Every pull request: yours, to review, worktrees", onClick: () => show("prs") });
   return v_flex()
-    .gap(18)
-    .children([section("head-your-prs", "Your PRs · needs you", k.info, mine, mineAll.length - mine.length, "waiting on others"), section("head-reviews", "Reviews · needs you", k.warning, theirs, theirsAll.length - theirs.length, "you've reviewed or aren't asked yet")].filter(Boolean));
+    .gap(10)
+    .child(StageHeading("head-your-prs", "Critical PRs", { color: k.destructive, count: critical.length, action: open }))
+    .child(
+      rows.length
+        ? v_flex().w_full().gap(14).children(rows.map((r, i) => h_flex().id(`pr-row-${i}-${prKey(r[0])}`).w_full().gap(14).items_stretch().children([...r.map((p) => div().flex_1().min_w(0).flex().child(PrCard(p, { show, openUrl }))), ...Array.from({ length: cols - r.length }, (_, j) => div().id(`pr-pad-${i}-${j}`).flex_1().min_w(0))])))
+        : div().text_size(TEXT.sm).text_color(k.dim).child("Nothing critical: no changes asked, no failing CI, nothing far behind main."),
+    );
 }

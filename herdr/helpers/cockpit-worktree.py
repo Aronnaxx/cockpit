@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 cockpit-worktree.py <owner/name> <number> <repo checkout> [--remove]
-cockpit-worktree.py --list | --remove-path <worktree>   (every worktree under ~/worktrees, or remove one)
+cockpit-worktree.py --list [repo checkout ...] | --remove-path <worktree> [--force]   (every worktree of those repositories and under ~/worktrees, or remove one; a dirty one only with --force)
 A git worktree of a pull request's head, to read and run its code beside your own checkout: fetches `pull/<number>/head`
 into the local branch `cockpit-pr-<number>` and adds the worktree at ~/worktrees/<name>-pr<number> (the one there is reused).
 --remove deletes the worktree and the branch. Prints JSON {path} or {error}. Your own branch and checkout are not touched.
@@ -17,33 +17,51 @@ def git(repo, *args):
     return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=300)
 
 
-def listing():
-    """Every worktree under ~/worktrees: {path, name, branch, head, dirty, pr, repo, at}."""
-    root = os.path.expanduser("~/worktrees")
-    out = []
-    for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
-        path = os.path.join(root, name)
-        if not os.path.exists(os.path.join(path, ".git")):
+def listing(roots):
+    """Every git worktree of the repositories at `roots` (plus any under ~/worktrees): {path, name, branch, head, dirty, main, repo, pr, at}."""
+    import re
+    seen, out, commons = set(), [], set()
+    wt = os.path.expanduser("~/worktrees")
+    candidates = [os.path.expanduser(r) for r in roots] + [os.path.join(wt, n) for n in (sorted(os.listdir(wt)) if os.path.isdir(wt) else [])]
+    for root in candidates:
+        if not os.path.exists(os.path.join(root, ".git")):
             continue
-        branch = git(path, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
-        common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
-        at = git(path, "log", "-1", "--format=%ct").stdout.strip()
-        m = __import__("re").search(r"-pr(\d+)$", name)
-        out.append({
-            "path": path, "name": name, "branch": branch, "head": git(path, "rev-parse", "--short", "HEAD").stdout.strip(),
-            "dirty": len([l for l in git(path, "status", "--porcelain").stdout.splitlines() if l.strip()]),
-            "pr": int(m.group(1)) if m else None, "repo": os.path.dirname(common) if common.endswith(".git") else common,
-            "at": int(at) * 1000 if at.isdigit() else 0,
-        })
+        common = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+        if not common or common in commons:
+            continue
+        commons.add(common)
+        repo = os.path.dirname(common) if common.endswith(".git") else common
+        porcelain = git(repo, "worktree", "list", "--porcelain").stdout
+        for block in porcelain.strip().split("\n\n"):
+            fields = dict((l.split(" ", 1) + [""])[:2] for l in block.splitlines() if l)
+            path = fields.get("worktree")
+            if not path or path in seen or not os.path.isdir(path) or "bare" in block:
+                continue
+            seen.add(path)
+            branch = fields.get("branch", "").replace("refs/heads/", "") or "(detached)"
+            at = git(path, "log", "-1", "--format=%ct").stdout.strip()
+            m = re.search(r"-pr(\d+)$", os.path.basename(path)) or re.match(r"cockpit-pr-(\d+)$", branch)
+            out.append({
+                "path": path, "name": os.path.basename(path), "branch": branch, "head": fields.get("HEAD", "")[:9],
+                "dirty": len([l for l in git(path, "status", "--porcelain").stdout.splitlines() if l.strip()]),
+                "main": path == repo, "repo": repo, "repo_name": os.path.basename(repo), "pr": int(m.group(1)) if m else None,
+                "at": int(at) * 1000 if at.isdigit() else 0,
+            })
     return out
 
 
 def main():
     if sys.argv[1:2] == ["--list"]:
-        print(json.dumps({"worktrees": listing()}))
+        print(json.dumps({"worktrees": listing(sys.argv[2:])}))
         return 0
     if sys.argv[1:2] == ["--remove-path"] and len(sys.argv) > 2:
         path = os.path.expanduser(sys.argv[2])
+        if not os.path.exists(os.path.join(path, ".git")) or os.path.isdir(os.path.join(path, ".git")):
+            print(json.dumps({"error": "That is a repository's own checkout, not a worktree"}))
+            return 0
+        if git(path, "status", "--porcelain").stdout.strip() and "--force" not in sys.argv:
+            print(json.dumps({"error": "It has uncommitted changes"}))
+            return 0
         common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
         repo = os.path.dirname(common)
         branch = git(path, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
