@@ -144,7 +144,8 @@
             { "id": "routines", "type": "block", "content": { "mod": "cockpit", "props": { "app": "routines" } }, "radius": 10, "border": { "width": 1, "color": "border" }, "background": "background", "shadow": "sm" },
             { "id": "mail", "type": "block", "content": { "mod": "cockpit", "props": { "app": "mail" } }, "radius": 10, "border": { "width": 1, "color": "border" }, "background": "background", "shadow": "sm" },
             { "id": "usage", "type": "block", "content": { "mod": "cockpit", "props": { "app": "usage" } }, "radius": 10, "border": { "width": 1, "color": "border" }, "background": "background", "shadow": "sm" },
-            { "id": "machines", "type": "block", "content": { "mod": "cockpit", "props": { "app": "machines" } }, "radius": 10, "border": { "width": 1, "color": "border" }, "background": "background", "shadow": "sm" }
+            { "id": "machines", "type": "block", "content": { "mod": "cockpit", "props": { "app": "machines" } }, "radius": 10, "border": { "width": 1, "color": "border" }, "background": "background", "shadow": "sm" },
+            { "id": "prs", "type": "block", "content": { "mod": "cockpit", "props": { "app": "prs" } }, "radius": 10, "border": { "width": 1, "color": "border" }, "background": "background", "shadow": "sm" }
           ],
           "padding": 8
         },

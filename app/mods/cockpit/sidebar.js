@@ -15,6 +15,7 @@ import { openUpdate, pending as pendingUpdate } from "./update.js";
 import { tokens, alpha, TEXT, RADIUS, Icon, Kbd, Button, SectionHeader, StageHeading, HoverCard, Hover, Flashes, CornerCount, dur, openMenu } from "./ui.js";
 import { AgentsModel, SubagentsModel, TitlesModel, PerfModel, OmoModel, sectionOpen, setSectionOpen, sessionFor, tpsText, localSessions, QuestionCard, QuotaBars, quotaByAgent, worstQuota, StageMark, Chips, STAGES, stageColor, stageAge, hours } from "./agentsui.js";
 import { followUsage } from "./usage.js";
+import { loadPrs } from "./prsdata.js";
 
 export const APPS = {
   inbox: { label: "Inbox", icon: "inbox", key: "⌘⌥1" },
@@ -26,8 +27,9 @@ export const APPS = {
   mail: { label: "Mail", icon: "mail", key: "⌘⌥7" },
   usage: { label: "Usage", icon: "gauge", key: "⌘⌥8" },
   machines: { label: "Machines", icon: "layers", key: "⌘⌥9" },
+  prs: { label: "Pull requests", icon: "git-pull-request", key: "⌘⌥P" },
 };
-export const DEFAULT_SPACES = ["inbox", "terminal", "actions", "to-do", "runbook", "meetings", "usage", "machines"];
+export const DEFAULT_SPACES = ["inbox", "terminal", "actions", "to-do", "runbook", "meetings", "usage", "machines", "prs"];
 
 /** An app's bubble from its view: what waits on you there, {count, tone} or null. */
 function appBadge(app, v) {
@@ -91,6 +93,9 @@ export default class Sidebar {
     this.perf.follow(cx, () => this.agents.rows);
     this.omo = new OmoModel();
     this.omo.follow(cx);
+    // Your pull requests, for the PRs tab's badge (how many wait on you) and every view that draws them.
+    loadPrs();
+    cx.timer.every(60000, () => loadPrs());
     // How many sub-agents work now, as the badge on the side panel's Subagents icon.
     cx.timer.every(3000, () => {
       // The badge on the rail's Subagents icon is the focused agent's own count, zero included.

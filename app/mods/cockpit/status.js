@@ -6,7 +6,7 @@
 
 import { div } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { run, focused, shared, setShared, layout, readTextFile } from "herdr";
+import { run, focused, shared, setShared, layout, readTextFile, hc, notify } from "herdr";
 import * as hub from "./hub.js";
 import { fleet, goToAgent, counts } from "./fleet.js";
 import { show } from "./sidebar.js";
@@ -102,7 +102,42 @@ export default class Status {
     return waiting[(i + 1) % Math.max(1, waiting.length)] ?? null;
   }
 
+  /** What the model and mode items offer for an agent: text typed to it (its own slash commands) or keys pressed in it. */
+  menuFor(kind, me) {
+    const program = String(me?.program?.key ?? me?.program?.name ?? me?.row?.program ?? "").toLowerCase();
+    const a = me.address;
+    const send = (label, text, icon = "terminal") => ({ label, icon, command: `st:send:${a}|${text}` });
+    const keys = (label, k, icon = "hand") => ({ label, icon, command: `st:keys:${a}|${k}` });
+    if (kind === "model") {
+      const items = [];
+      if (/claude/.test(program)) items.push(send("Opus", "/model opus"), send("Sonnet", "/model sonnet"), send("Haiku", "/model haiku"), "separator", send("Open the /model picker", "/model"));
+      else if (/opencode/.test(program)) items.push(send("Open the model picker (/models)", "/models"));
+      else if (/codex/.test(program)) items.push(send("Open the /model picker", "/model"));
+      else items.push(send("Open the /model picker", "/model"));
+      items.push("separator", { label: "Context window of this session", icon: "gauge", command: "st:context" });
+      return items;
+    }
+    if (/claude/.test(program)) return [keys("Next mode (⇧⇥): ask, accept edits, plan, auto", "shift+tab")];
+    if (/opencode/.test(program)) return [keys("Next agent (Tab): build, plan, and your own", "tab")];
+    if (/codex/.test(program)) return [send("Approvals and sandbox (/approvals)", "/approvals")];
+    return [];
+  }
+
+  /** Types into or presses keys in the focused agent's terminal: only text when it is idle (never into a turn in progress). */
+  async sendTo(spec, cx) {
+    const [, how, rest] = spec.match(/^st:(send|keys):(.*)$/) ?? [];
+    if (!how) return;
+    const [address, value] = [rest.slice(0, rest.lastIndexOf("|")), rest.slice(rest.lastIndexOf("|") + 1)];
+    const a = fleet(this.rows, this.home).find((x) => x.address === address);
+    if (how === "send" && a?.status === "working") return notify({ title: "It is busy", body: `${a.title}: wait until it is idle, then ${value}` });
+    const r = await hc(how === "send" ? ["send", address, value] : ["keys", address, ...value.split(" ")]).catch((e) => ({ stderr: String(e?.message ?? e) }));
+    notify({ title: r?.stderr && !r?.stdout ? "Could not send it" : how === "send" ? `Sent ${value}` : "Pressed the keys", body: r?.stderr ? String(r.stderr).slice(0, 120) : a?.title ?? address });
+    cx.notify();
+  }
+
   command(c, cx) {
+    if (c === "st:context") return togglePanel("context");
+    if (c.startsWith("st:send:") || c.startsWith("st:keys:")) return void this.sendTo(c, cx);
     const list = fleet(this.rows, this.home);
     const me = this.current(list);
     if (c === "home") show((shared("cockpit.app") ?? "home") === "home" ? "work" : "home");
@@ -212,9 +247,10 @@ export default class Status {
     // The machines, limits, presets and speed, and the focused agent's model: in the room the bar has in the middle.
     const st = shared("cockpit.status") ?? {};
     const toneOf = (s) => (s.tone === "bad" ? k.destructive : s.tone === "warn" ? k.warning : s.tone === "live" ? k.working : k.foreground);
-    const go = { agent: () => togglePanel("context"), mode: undefined, usage: () => show("usage"), machines: () => show("machines"), omo: () => show("machines"), tps: undefined };
+    const pick = (kind) => () => { const items = me ? this.menuFor(kind, me) : []; if (items.length) openMenu(items, { width: 300 }); else if (kind === "model") togglePanel("context"); };
+    const go = { agent: pick("model"), mode: pick("mode"), usage: () => show("usage"), machines: () => show("machines"), omo: () => show("machines"), tps: undefined };
     const label = { agent: "Model", mode: "Mode", usage: "Usage", machines: "Load", omo: "OMO", tps: "Speed" };
-    const tip = { agent: "The focused agent's model and context window  ⌃⌘6", mode: "The focused agent's mode: permissions, approvals, or its OpenCode agent", usage: "The focused agent's own 5-hour and weekly limits", machines: "This computer's CPU and GPU", omo: "The OpenCode preset of this agent's machine", tps: "The focused agent's latest speed" };
+    const tip = { agent: "The focused agent's model and context window: click to change the model", mode: "The focused agent's mode: click to change it", usage: "The focused agent's own 5-hour and weekly limits", machines: "This computer's CPU and GPU", omo: "The OpenCode preset of this agent's machine", tps: "The focused agent's latest speed" };
     // The limits as bars, as Claude Code's own status line draws them: filled in green, amber from 75%, red from 90%, with the reset.
     const bar = (name, win) => {
       const c = win.pct >= 90 ? k.destructive : win.pct >= 75 ? k.warning : k.success;
