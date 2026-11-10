@@ -123,7 +123,7 @@ export function PrCard(p, { show, openUrl }) {
     .when(reviewers.length > 0, (e) =>
       e.child(
         div().truncate().text_size(TEXT.xs).text_color(k.dim).child(
-          reviewers.slice(0, 4).map((r) => `${r.login} ${r.re_requested ? "re-requested" : String(r.state ?? "").toLowerCase().replace(/_/g, " ") || "—"}${r.comments ? ` · ${r.comments}💬` : ""}`).join("   ·   "),
+          reviewers.slice(0, 4).map((r) => `${r.login} ${r.re_requested ? "re-requested" : String(r.state ?? "").toLowerCase().replace(/_/g, " ") || "—"}${r.comments ? ` (${r.comments} comment${r.comments === 1 ? "" : "s"})` : ""}`).join("   ·   "),
         ),
       ),
     )

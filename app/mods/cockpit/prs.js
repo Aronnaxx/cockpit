@@ -5,9 +5,9 @@
 
 import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState, TextView } from "gpui-base";
-import { exec, notify, run, shared } from "herdr";
+import { exec, notify, run, shared, setShared } from "herdr";
 import * as hub from "./hub.js";
-import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mono, Progress, Spinner, TextField, Tabs, Chip, AlertDialog, openMenu } from "./ui.js";
+import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mono, Progress, Spinner, TextField, Tabs, Chip, AlertDialog, openMenu, Icon } from "./ui.js";
 import { loadPrs, prs, prsConfig, ago } from "./prsdata.js";
 import { urgent, urgency } from "./prcards.js";
 import { Drafts } from "./prreview.js";
@@ -41,6 +41,9 @@ export default class Prs {
       cx.notify();
     });
     this.repoF = null;
+    this.authorF = null;
+    this.reviewF = "all";
+    this.sort = "needs";
     this.ci = new Map();
     this.cfg = {};
     this.busy = null;
@@ -91,6 +94,14 @@ export default class Prs {
     // From a menu: prs:<kind>:<agent>:<owner/name#number>
     const m = c.match(/^prs:([a-z]+):([a-z-]+):(.+)$/);
     if (!m) return;
+    if (m[1] === "filter") {
+      const v = m[3] === "__all" ? null : m[3];
+      if (m[2] === "author") this.authorF = v;
+      else if (m[2] === "repo") this.repoF = v;
+      else if (m[2] === "review") this.reviewF = v ?? "all";
+      else if (m[2] === "sort") this.sort = v ?? "needs";
+      return cx.notify();
+    }
     const p = this.list().find((x) => keyOf(x) === m[3]);
     if (p && m[1] === "openin") this.openIn(cx, p, m[2]);
     else if (p) this.start(cx, p, m[1], m[2]);
@@ -307,31 +318,43 @@ export default class Prs {
     return div().flex_none().px(6).h(16).flex().items_center().rounded(4).text_size(9.5).font_semibold().bg(alpha(c, t.who === "you" ? 0.16 : 0.12)).text_color(t.who === "you" ? c : k.mutedFg).child(label);
   }
 
+  /** One pull request in the list, as GitHub lists them: a state icon, the title with its flags, then #number, repository, author, when, approvals, CI. */
   row(k, p) {
-    const on = this.sel === keyOf(p);
-    return v_flex()
+    const hot = urgent(p);
+    const c = hot ? k[hot.tone] : this.turnColor(k, p.turn);
+    const unresolved = p.unresolved ?? 0;
+    return h_flex()
       .id(`pr-${keyOf(p)}`)
-      .gap(3)
-      .px(10)
-      .py(8)
-      .rounded(RADIUS.md)
+      .gap(12)
+      .items_start()
+      .px(14)
+      .py(10)
+      .border_b_1()
+      .border_color(k.border)
       .cursor_pointer()
-      .border_1()
-      .border_color(on ? k.ring : alpha(k.border, 0))
-      .when(on, (e) => e.bg(k.selected))
-      .when(!on, (e) => e.hover((x) => x.bg(k.accent)))
+      .hover((x) => x.bg(k.accent))
       .on_click((_e, cx) => this.select(cx, p))
-      .child(h_flex().gap(6).items_center().child(Mono(`${p.repo.split("/")[1]}#${p.number}`, { size: TEXT.xs, color: k.mutedFg })).child(div().flex_1()).when(Boolean(this.pill(k, p)), (e) => e.child(this.pill(k, p))))
-      .child(div().truncate().text_size(TEXT.sm).text_color(k.foreground).child(p.title))
+      .child(div().pt(2).child(Icon(p.draft ? "git-pull-request-draft" : "git-pull-request", { size: 16, color: p.draft ? k.mutedFg : c })))
       .child(
-        h_flex()
-          .gap(8)
-          .text_size(TEXT.xs)
-          .text_color(k.dim)
-          .child(Mono(`${p.approvals}/${p.required}`, { size: TEXT.xs, color: p.approvals >= p.required ? k.success : k.mutedFg }))
-          .child(div().child(`active ${ago(p.last_activity)}`))
-          .when(p.role === "author" && (p.behind ?? 0) > 0, (e) => e.child(div().text_color(k.warning).child(`${p.behind} behind main`)))
-          .when(p.ci.failed.length > 0, (e) => e.child(div().text_color(k.destructive).child(`CI: ${p.ci.failed.length} failed`))),
+        v_flex()
+          .flex_1()
+          .min_w(0)
+          .gap(3)
+          .child(h_flex().gap(8).items_center().child(div().truncate().font_semibold().text_size(TEXT.base).text_color(k.foreground).child(p.title)).when(Boolean(this.pill(k, p)), (e) => e.child(this.pill(k, p))).when(p.draft, (e) => e.child(Badge("draft", "secondary"))))
+          .child(
+            h_flex()
+              .gap(8)
+              .flex_wrap()
+              .text_size(TEXT.xs)
+              .text_color(k.dim)
+              .child(Mono(`#${p.number}`, { size: TEXT.xs, color: k.mutedFg }))
+              .child(div().child(p.repo.split("/")[1]))
+              .child(div().child(`${p.author} · active ${ago(p.last_activity)}`))
+              .child(Mono(`${p.approvals}/${p.required}`, { size: TEXT.xs, color: p.approvals >= p.required ? k.success : k.mutedFg }))
+              .child(div().text_color(p.ci.failed.length ? k.destructive : p.ci.pending ? k.warning : k.success).child(p.ci.failed.length ? `CI: ${p.ci.failed.length} failed` : p.ci.pending ? "CI running" : p.ci.state === "none" ? "" : "CI passing"))
+              .when(unresolved > 0, (e) => e.child(div().text_color(k.warning).child(`${unresolved} unresolved`)))
+              .when(p.role === "author" && (p.behind ?? 0) > 0, (e) => e.child(div().text_color(k.warning).child(`${p.behind} behind main`))),
+          ),
       );
   }
 
@@ -456,13 +479,6 @@ export default class Prs {
     const k = tokens();
     const d = prs();
     const list = this.list();
-    const group = (title, items) =>
-      items.length
-        ? v_flex()
-            .gap(4)
-            .child(div().px(10).pt(6).text_size(TEXT.xs).font_semibold().text_color(k.dim).child(`${title} · ${items.length}`))
-            .children(items.map((p) => this.row(k, p)))
-        : null;
     const order = (a, b) => (urgency(b) - urgency(a)) || (b.turn?.who === "you") - (a.turn?.who === "you") || b.last_activity - a.last_activity;
     // Home's "Details" leaves the pull request to open in this shared value.
     const sc = shared("cockpit.prs.scope");
@@ -478,22 +494,67 @@ export default class Prs {
       const hit = list.find((p) => keyOf(p) === want);
       if (hit) { this.scope = "mine"; this.repoF = null; cx.timer.after(1, (cx) => this.select(cx, hit)); }
     }
-    const allMine = [...(d?.mine ?? [])].sort(order);
-    const allTheirs = [...(d?.assigned ?? [])].filter((p) => p.turn?.who !== "none").sort(order);
-    const repos = [...new Set([...allMine, ...allTheirs].map((p) => p.repo))].sort();
-    const inRepo = (p) => !this.repoF || p.repo === this.repoF;
+    const all = this.scope === "mine" ? d?.mine ?? [] : (d?.assigned ?? []).filter((p) => p.turn?.who !== "none");
+    const inScope = { mine: d?.mine ?? [], review: (d?.assigned ?? []).filter((p) => p.turn?.who !== "none") };
+    const repos = [...new Set(all.map((p) => p.repo))].sort();
+    const authors = [...new Set(all.map((p) => p.author))].sort((a, b) => a.localeCompare(b));
     const needle = this.q.value().trim().toLowerCase();
     const matches = (p) => !needle || `${p.repo} ${p.number} ${p.title} ${p.branch} ${p.author} ${(p.reviewers ?? []).map((r) => r.login).join(" ")}`.toLowerCase().includes(needle);
-    const mine = this.scope === "review" ? [] : allMine.filter(inRepo).filter(matches);
-    const theirs = this.scope === "mine" ? [] : allTheirs.filter(inRepo).filter(matches);
-    const youN = (this.scope === "mine" ? allMine : allTheirs).filter((p) => p.turn?.who === "you").length;
-    const summary = this.scope === "mine" ? `${youN} on you · ${allMine.length - youN} waiting` : `${youN} for you · ${allTheirs.length - youN} team`;
-    const filters = v_flex()
+    const reviewOk = (p) =>
+      this.reviewF === "all" ||
+      (this.reviewF === "you" && p.turn?.who === "you") ||
+      (this.reviewF === "rerequested" && (p.turn?.why === "re-requested" || p.turn?.why === "re-review")) ||
+      (this.reviewF === "approved" && p.decision === "APPROVED") ||
+      (this.reviewF === "changes" && p.decision === "CHANGES_REQUESTED") ||
+      (this.reviewF === "draft" && p.draft) ||
+      (this.reviewF === "ci" && p.ci.failed.length > 0);
+    const sorters = {
+      needs: (a, b) => (urgency(b) - urgency(a)) || (b.turn?.who === "you") - (a.turn?.who === "you") || b.last_activity - a.last_activity,
+      updated: (a, b) => b.last_activity - a.last_activity,
+      stale: (a, b) => a.last_activity - b.last_activity,
+      threads: (a, b) => (b.unresolved ?? 0) - (a.unresolved ?? 0) || b.last_activity - a.last_activity,
+    };
+    const shownList = all.filter((p) => (!this.repoF || p.repo === this.repoF) && (!this.authorF || p.author === this.authorF) && reviewOk(p) && matches(p)).sort(sorters[this.sort]);
+    const youN = all.filter((p) => p.turn?.who === "you").length;
+    const summary = this.scope === "mine" ? `${youN} on you · ${all.length - youN} waiting` : `${youN} for you · ${all.length - youN} team`;
+    const dd = (id, label, items) =>
+      h_flex().id(id).h(28).px(8).gap(4).items_center().rounded(RADIUS.md).cursor_pointer().text_size(TEXT.sm).text_color(k.mutedFg).hover((x) => x.bg(k.accent).text_color(k.foreground)).on_click(() => openMenu(items, { width: 240 })).child(div().child(label)).child(Icon("chevron-down", { size: 12 }));
+    const pick = (kind, value, label, on) => ({ label, icon: on ? "check" : undefined, command: `prs:filter:${kind}:${value ?? "__all"}` });
+    const REVIEWS = [["all", "Any state"], ["you", "Needs you"], ["rerequested", "Re-review requested"], ["approved", "Approved"], ["changes", "Changes requested"], ["draft", "Drafts"], ["ci", "CI failing"]];
+    const SORTS = [["needs", "Needs you first"], ["updated", "Recently updated"], ["stale", "Least recently updated"], ["threads", "Most unresolved threads"]];
+    const filtering = this.repoF || this.authorF || this.reviewF !== "all" || needle;
+    const bar = v_flex()
       .gap(8)
-      .child(Tabs("prs-scope", { value: this.scope, onChange: (v, cx) => ((this.scope = v), cx.notify()), items: [{ value: "review", label: "To review", count: allTheirs.length }, { value: "mine", label: "Yours", count: allMine.length }] }))
-      .child(div().text_size(TEXT.xs).text_color(k.dim).child(summary))
-      .child(TextField(this.q, { active: false }))
-      .child(h_flex().gap(6).flex_wrap().children([Chip("all repos", { id: "prs-repo-all", color: this.repoF ? undefined : k.ring, onClick: (_e, cx) => ((this.repoF = null), cx.notify()) }), ...repos.map((r) => Chip(r.split("/")[1], { id: `prs-repo-${r}`, color: this.repoF === r ? k.ring : undefined, onClick: (_e, cx) => ((this.repoF = this.repoF === r ? null : r), cx.notify()) }))]));
+      .child(TextField(this.q, { active: false, leading: Icon("search", { size: 14, color: k.mutedFg }) }))
+      .child(
+        h_flex()
+          .gap(4)
+          .items_center()
+          .h(44)
+          .px(10)
+          .rounded_t(RADIUS.lg)
+          .border_1()
+          .border_color(k.border)
+          .bg(k.muted)
+          .child(Tabs("prs-scope", { value: this.scope, onChange: (v, cx) => ((this.scope = v), (this.repoF = null), (this.authorF = null), cx.notify()), items: [{ value: "review", label: "To review", count: inScope.review.length }, { value: "mine", label: "Yours", count: inScope.mine.length }] }))
+          .child(div().pl(8).text_size(TEXT.xs).text_color(k.dim).child(summary))
+          .child(div().flex_1())
+          .child(dd("prs-dd-author", this.authorF ? `Author: ${this.authorF}` : "Author", [pick("author", null, "Anyone", !this.authorF), ...authors.map((a) => pick("author", a, a, this.authorF === a))]))
+          .child(dd("prs-dd-repo", this.repoF ? `Repository: ${this.repoF.split("/")[1]}` : "Repository", [pick("repo", null, "All repositories", !this.repoF), ...repos.map((r) => pick("repo", r, r.split("/")[1], this.repoF === r))]))
+          .child(dd("prs-dd-review", this.reviewF === "all" ? "Reviews" : `Reviews: ${REVIEWS.find(([v]) => v === this.reviewF)?.[1]}`, REVIEWS.map(([v, l]) => pick("review", v, l, this.reviewF === v))))
+          .child(dd("prs-dd-sort", SORTS.find(([v]) => v === this.sort)?.[1], SORTS.map(([v, l]) => pick("sort", v, l, this.sort === v))))
+          .when(Boolean(filtering), (e) => e.child(Button("prs-clear", { label: "Clear", variant: "ghost", size: "sm", onClick: (_e, cx) => { this.repoF = null; this.authorF = null; this.reviewF = "all"; this.q.set_value(""); cx.notify(); } }))),
+      );
+    const listView = v_flex()
+      .id("prs-list")
+      .flex_1()
+      .min_h(0)
+      .overflow_y_scrollbar()
+      .gap(0)
+      .px(24)
+      .py(16)
+      .child(bar)
+      .child(v_flex().border_x_1().border_b_1().border_color(k.border).rounded_b(RADIUS.lg).children(shownList.length ? shownList.map((p) => this.row(k, p)) : [h_flex().h(120).justify_center().items_center().text_color(k.mutedFg).child("No pull requests match.")]));
     const sel = list.find((p) => keyOf(p) === this.sel) ?? null;
     const yours = list.filter((p) => p.turn?.who === "you").length;
     return v_flex()
@@ -517,14 +578,18 @@ export default class Prs {
           ? h_flex().h(160).justify_center().items_center().gap(8).text_color(k.mutedFg).child(Spinner({ size: 14 })).child("Asking GitHub…")
           : d.error && !list.length
             ? Empty({ icon: "git-pull-request", title: "Could not read GitHub", description: d.error })
-            : h_flex()
-                .flex_1()
-                .min_h(0)
-                .gap(16)
-                .px(24)
-                .py(16)
-                .child(v_flex().id("prs-list").w(380).flex_none().min_h(0).gap(10).overflow_y_scrollbar().children([filters, group("Your pull requests", mine), group("Waiting for your review", theirs)].filter(Boolean)))
-                .child(v_flex().id("prs-detail-scroll").flex_1().min_w(0).min_h(0).overflow_y_scrollbar().child(sel ? this.detail(k, sel, cx) : Empty({ icon: "git-pull-request", title: "Pick a pull request", description: "Its reviewers, CI and an agent to work on it show here." }))),
+            : sel
+              ? v_flex()
+                  .id("prs-detail-scroll")
+                  .flex_1()
+                  .min_h(0)
+                  .overflow_y_scrollbar()
+                  .px(24)
+                  .py(16)
+                  .gap(12)
+                  .child(h_flex().child(Button("prs-back", { label: "Pull requests", icon: "chevron-left", variant: "ghost", size: "sm", onClick: (_e, cx) => ((this.sel = null), setShared("cockpit.prs.focus", null), cx.notify()) })))
+                  .child(this.detail(k, sel, cx))
+              : listView,
       )
       .when(Boolean(this.drafts.confirm), (e) => {
         const dp = this.drafts.confirm.p;

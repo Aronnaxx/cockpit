@@ -29,9 +29,15 @@ export class Drafts {
     const text = await readTextFile(draftFile(home, p)).catch(() => null);
     const e = this.m.get(keyOf(p));
     if (e && e.raw === text) return false;
+    // While you type (or just did), what is on disk is your own save: leave the boxes alone.
+    if (e?.exists && Date.now() - (e.touched ?? 0) < 6000) return false;
     if (text === null) {
-      this.m.set(keyOf(p), { raw: null, exists: false });
-      return !e || e.exists;
+      if (e && !e.exists) return false;
+      // No draft yet: the box is there to type in; the first keystroke makes the draft.
+      const blank = { raw: null, exists: false, verdict: "COMMENT", chain: Promise.resolve(), p, rows: [] };
+      blank.summary = this.area("", "Leave a review comment", 3, () => this.begin(cx, blank));
+      this.m.set(keyOf(p), blank);
+      return true;
     }
     let d = {};
     try {
@@ -44,6 +50,14 @@ export class Drafts {
     for (const c of d.comments ?? []) if (c.path) this.ensureFile(cx, p, c.path);
     this.m.set(keyOf(p), entry);
     return true;
+  }
+
+  /** The first keystroke (or a verdict, or a line comment) in a blank box: it becomes a draft, kept on disk. */
+  begin(cx, e) {
+    if (e.exists) return this.queueSave(cx, e);
+    e.exists = true;
+    e.summary.on("change", () => this.queueSave(cx, e));
+    this.queueSave(cx, e);
   }
 
   /** Reads a file of the pull request once, for the lines shown under a comment. */
@@ -104,6 +118,7 @@ export class Drafts {
 
   /** Writes the draft after a typing pause; saves one at a time. */
   queueSave(cx, e) {
+    e.touched = Date.now();
     e.version = (e.version ?? 0) + 1;
     const mine = e.version;
     cx.timer.after(500, () => {
@@ -145,7 +160,8 @@ export class Drafts {
 
   addComment(cx, p, c = {}) {
     const e = this.m.get(keyOf(p));
-    if (!e?.exists) return this.start(cx, p, c);
+    if (!e) return this.start(cx, p, c);
+    if (!e.exists) this.begin(cx, e);
     e.rows.push(this.row(c, () => this.queueSave(cx, e)));
     this.queueSave(cx, e);
     cx.notify();
@@ -195,36 +211,32 @@ export class Drafts {
     return div().w_full().rounded(RADIUS.md).border_1().border_color(k.input).bg(k.background).px(10).py(6).child(Textarea.new(state).w_full().text_size(TEXT.sm));
   }
 
-  /** The draft's page section: edit, or preview of what will be posted. `agentButton` starts an agent that writes the draft. */
+  /** The review box, like GitHub's "Leave a comment": a summary, a verdict, the pending line comments, then Save draft or Post. */
   section(k, p, { agentButton } = {}) {
     const e = this.m.get(keyOf(p));
-    const head = (extra = []) =>
-      h_flex().gap(8).items_center().child(div().text_size(TEXT.base).font_semibold().child("Review draft")).child(div().flex_1()).children(extra.filter(Boolean));
-    const frame = (...kids) => v_flex().gap(10).p(14).rounded(RADIUS.lg).border_1().border_color(alpha(k.info, 0.5)).bg(alpha(k.info, 0.05)).children(kids.filter(Boolean));
-    if (!e?.exists)
-      return frame(
-        head(),
-        div().text_size(TEXT.sm).text_color(k.mutedFg).whitespace_normal().child("Write a review here, or have an agent write one. You edit it, preview what GitHub will get, and nothing is sent until you post it."),
-        h_flex().gap(8).child(Button("rv-start", { label: "Start a draft", icon: "file-text", size: "sm", variant: "outline", onClick: (_e, cx) => this.start(cx, p) })).children([agentButton].filter(Boolean)),
-      );
+    if (!e) return div().text_size(TEXT.xs).text_color(k.dim).child("Reading the draft…");
     const showPreview = this.preview.has(keyOf(p));
     const { lines, replies } = this.counts(e);
+    const text = e.summary.value().trim();
+    const empty = !lines && !replies && !text && e.verdict === "COMMENT";
     const tone = e.verdict === "APPROVE" ? k.success : e.verdict === "REQUEST_CHANGES" ? k.destructive : k.mutedFg;
-    const verdictTabs = Tabs("rv-verdict", { value: e.verdict, onChange: (v, cx) => ((e.verdict = v), this.queueSave(cx, e), cx.notify()), items: VERDICTS.map(([value, label]) => ({ value, label })) });
+    const frame = (...kids) => v_flex().gap(10).p(14).rounded(RADIUS.lg).border_1().border_color(e.exists ? alpha(k.info, 0.5) : k.border).bg(e.exists ? alpha(k.info, 0.04) : k.card).children(kids.filter(Boolean));
+    const head = (extra = []) => h_flex().gap(8).items_center().child(div().text_size(TEXT.base).font_semibold().child("Your review")).when(e.exists, (x) => x.child(Badge("draft", "secondary"))).child(div().flex_1()).children(extra.filter(Boolean));
+    const setVerdict = (v, cx) => { e.verdict = v; this.begin(cx, e); cx.notify(); };
     const actions = h_flex().gap(8).items_center().children([
-      Button("rv-preview", { label: showPreview ? "Back to editing" : "Preview", icon: showPreview ? "pencil" : "eye", size: "sm", variant: "outline", onClick: (_e, cx) => { showPreview ? this.preview.delete(keyOf(p)) : this.preview.add(keyOf(p)); cx.notify(); } }),
-      Button("rv-post", { label: this.busy === keyOf(p) ? "Posting…" : "Post review…", size: "sm", disabled: this.busy === keyOf(p) || (!lines && !replies && !e.summary.value().trim() && e.verdict === "COMMENT"), onClick: (_e, cx) => ((this.confirm = { p }), cx.notify()) }),
-      Button("rv-discard", { label: "Discard", size: "sm", variant: "ghost", onClick: (_e, cx) => this.discard(cx, p) }),
+      e.exists ? Button("rv-preview", { label: showPreview ? "Back to editing" : "Preview", icon: showPreview ? "pencil" : "eye", size: "sm", variant: "ghost", onClick: (_e, cx) => { showPreview ? this.preview.delete(keyOf(p)) : this.preview.add(keyOf(p)); cx.notify(); } }) : null,
+      e.exists ? Button("rv-discard", { label: "Discard", size: "sm", variant: "ghost", onClick: (_e, cx) => this.discard(cx, p) }) : null,
+      Button("rv-save", { label: "Save draft", size: "sm", variant: "outline", disabled: empty, onClick: (_e, cx) => { e.chain = e.chain.then(() => this.save(e)).catch(() => {}); notify({ title: "Draft saved", body: `${keyOf(p)} · it stays here until you post it` }); cx.notify(); } }),
+      Button("rv-post", { label: this.busy === keyOf(p) ? "Posting…" : "Post review…", size: "sm", disabled: this.busy === keyOf(p) || empty, onClick: (_e, cx) => ((this.confirm = { p }), cx.notify()) }),
     ]);
     if (showPreview) {
       const verb = e.verdict === "APPROVE" ? "approved these changes" : e.verdict === "REQUEST_CHANGES" ? "requested changes" : "reviewed";
-      const summary = e.summary.value().trim();
       return frame(
-        head([Badge("preview", "secondary"), actions]),
+        head(),
         div().text_size(TEXT.xs).text_color(k.dim).child("This is what GitHub will get. Nothing is sent until you post it."),
         v_flex().gap(8).p(12).rounded(RADIUS.md).border_1().border_color(k.border).bg(k.card)
           .child(h_flex().gap(8).items_center().child(div().text_size(TEXT.sm).font_semibold().child("You")).child(div().text_size(TEXT.sm).text_color(tone).child(verb)))
-          .child(summary ? this.md(`rv-md-sum-${keyOf(p)}`, summary) : div().text_size(TEXT.sm).text_color(k.dim).child("No summary.")),
+          .child(text ? this.md(`rv-md-sum-${keyOf(p)}`, text) : div().text_size(TEXT.sm).text_color(k.dim).child("No summary.")),
         ...e.rows.filter((r) => r.body.value().trim()).map((r) =>
           v_flex().id(`rv-pv-${r.id}`).gap(6).p(10).rounded(RADIUS.md).border_1().border_color(k.border)
             .child(r.reply_to ? h_flex().gap(6).child(Badge("reply", "secondary")).child(div().text_size(TEXT.xs).text_color(k.dim).truncate().child(r.quote ?? "in the thread")) : Mono(`${r.path.value()}${r.line.value() ? `:${r.line.value()}` : ""}`, { size: TEXT.xs, color: k.foreground }))
@@ -232,12 +244,13 @@ export class Drafts {
             .child(this.md(`rv-md-${r.id}`, r.body.value())),
         ),
         div().text_size(TEXT.xs).text_color(k.dim).child(`${lines} line comment${lines === 1 ? "" : "s"} and ${replies} repl${replies === 1 ? "y" : "ies"}; empty ones are left out.`),
+        h_flex().justify_end().child(actions),
       );
     }
     return frame(
-      head([actions]),
-      verdictTabs,
+      head(),
       this.box(k, e.summary),
+      e.rows.length ? div().text_size(TEXT.xs).font_semibold().text_color(k.mutedFg).child(`Pending comments · ${e.rows.length}`) : null,
       ...e.rows.map((r) =>
         v_flex().id(`rv-row-${r.id}`).gap(6).p(10).rounded(RADIUS.md).border_1().border_color(k.border).bg(k.card)
           .child(
@@ -252,7 +265,8 @@ export class Drafts {
           .children([!r.reply_to ? this.snippet(k, p, r.path.value().trim(), r.line.value()) : null].filter(Boolean))
           .child(this.box(k, r.body)),
       ),
-      h_flex().gap(8).child(Button("rv-add", { label: "Add a line comment", icon: "plus", size: "sm", variant: "outline", onClick: (_e, cx) => this.addComment(cx, p) })).children([agentButton].filter(Boolean)),
+      h_flex().gap(8).items_center().child(Button("rv-add", { label: "Add a line comment", icon: "plus", size: "sm", variant: "ghost", onClick: (_e, cx) => this.addComment(cx, p) })).children([agentButton].filter(Boolean)).child(div().flex_1()).child(Tabs("rv-verdict", { value: e.verdict, onChange: setVerdict, items: VERDICTS.map(([value, label]) => ({ value, label })) })),
+      h_flex().justify_end().child(actions),
     );
   }
 }
