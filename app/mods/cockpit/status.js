@@ -63,7 +63,7 @@ export default class Status {
         } catch {}
       });
     readItems(cx);
-    cx.timer.every(8000, (cx) => readItems(cx));
+    cx.timer.every(2000, (cx) => readItems(cx));
     this.rows = null;
     this.home = null;
     this.queue = null;

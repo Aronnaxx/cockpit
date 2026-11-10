@@ -38,7 +38,7 @@ export default class Activity {
         } catch {}
       });
     read(cx);
-    cx.timer.every(6000, (cx) => read(cx));
+    cx.timer.every(2000, (cx) => read(cx));
     // The tab bar restores a space's panel only among these, so the cockpit's own panels survive a space switch.
     const panels = shared("workspace.panels");
     const want = Object.values(PANELS);

@@ -12,6 +12,18 @@ export const prKey = (p) => `${p.repo}#${p.number}`;
 
 const WHY = { review: "REVIEW", "re-review": "RE-REVIEW", ci: "FIX CI", changes: "YOUR MOVE", comments: "YOUR MOVE", merge: "READY TO MERGE", draft: "DRAFT", reviewers: "ASK REVIEWERS" };
 
+/** What cannot wait on an author's own pull request, whoever's move it is: changes asked, CI failing. */
+export function urgent(p) {
+  if (p.role !== "author") return null;
+  if (p.decision === "CHANGES_REQUESTED") return { label: "CHANGES ASKED", tone: "destructive" };
+  if ((p.ci?.failed?.length ?? 0) > 0) return { label: "CI FAILING", tone: "destructive" };
+  if ((p.behind ?? 0) > 0) return { label: p.behind >= 20 ? `${p.behind} BEHIND MAIN` : "BEHIND MAIN", tone: p.behind >= 20 ? "destructive" : "warning" };
+  return null;
+}
+
+/** Urgent ones first, red before amber. */
+export const urgency = (p) => { const u = urgent(p); return u ? (u.tone === "destructive" ? 2 : 1) : 0; };
+
 /** Red when it is on you to fix, amber when it is on you for anything else, blue while it waits on someone, grey otherwise. */
 export function turnColor(k, t) {
   return t?.who === "you" ? (t.why === "ci" || t.why === "changes" ? k.destructive : t.why === "merge" ? k.success : k.warning) : t?.who === "them" ? k.info : k.border;
@@ -52,7 +64,8 @@ function chip(k, text, color, mono = false) {
 export function PrCard(p, { show, openUrl }) {
   const k = tokens();
   const t = p.turn;
-  const c = turnColor(k, t);
+  const hot = urgent(p);
+  const c = hot ? k[hot.tone] : turnColor(k, t);
   const you = t?.who === "you";
   const author = p.role === "author";
   const approvals = `${p.approvals}/${p.required} approvals`;
@@ -83,10 +96,11 @@ export function PrCard(p, { show, openUrl }) {
         .items_center()
         .child(chip(k, p.repo.split("/")[1], k.info))
         .child(div().flex_1().min_w(0).truncate().text_size(TEXT.xs).text_color(k.dim).child(p.branch))
+        .when(Boolean(hot), (e) => e.child(div().flex_none().px(6).h(16).flex().items_center().rounded(4).text_size(9.5).font_semibold().bg(alpha(k[hot.tone], 0.2)).text_color(k[hot.tone]).child(hot.label)))
         .when(Boolean(turnLabel(t)), (e) => e.child(div().flex_none().px(6).h(16).flex().items_center().rounded(4).text_size(9.5).font_semibold().bg(alpha(c, you ? 0.16 : 0.12)).text_color(you ? c : k.mutedFg).child(turnLabel(t)))),
     )
     .child(div().text_size(TEXT.base).font_medium().text_color(k.foreground).child(p.title))
-    .when(Boolean(t?.detail), (e) => e.child(div().text_size(TEXT.sm).text_color(you ? c : k.mutedFg).child(t.detail)))
+    .when(Boolean(t?.detail), (e) => e.child(div().text_size(TEXT.sm).text_color(you || hot ? c : k.mutedFg).child(t.detail)))
     .child(
       h_flex()
         .gap(6)
@@ -122,7 +136,7 @@ export function PrCard(p, { show, openUrl }) {
 /** The "Your PRs" and "Reviews" areas, each with how many wait on you. */
 export function PrSections(d, { cardBox, show, openUrl }) {
   const k = tokens();
-  const order = (a, b) => (b.turn?.who === "you") - (a.turn?.who === "you") || b.last_activity - a.last_activity;
+  const order = (a, b) => (urgency(b) - urgency(a)) || (b.turn?.who === "you") - (a.turn?.who === "you") || b.last_activity - a.last_activity;
   const mine = [...(d?.mine ?? [])].sort(order);
   const theirs = [...(d?.assigned ?? [])].filter((p) => p.turn?.who !== "none").sort(order);
   const section = (id, label, color, items) =>

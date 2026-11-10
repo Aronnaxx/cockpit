@@ -9,6 +9,7 @@ import { exec, notify, run, shared } from "herdr";
 import * as hub from "./hub.js";
 import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mono, Progress, Spinner, TextField, Tabs, Chip } from "./ui.js";
 import { loadPrs, prs, prsConfig, ago } from "./prsdata.js";
+import { urgent, urgency } from "./prcards.js";
 import { LAUNCH_AGENTS, launchAgent, lastAgent, prPrompt, repoFolder } from "./agentlaunch.js";
 import { OmoModel } from "./agentsui.js";
 
@@ -46,6 +47,8 @@ export default class Prs {
     this.convo = new Map();
     this.openThreads = new Set();
     this.worktrees = new Set();
+    this.trees = [];
+    this.loadTrees(cx);
     this.omo = new OmoModel();
     this.omo.follow(cx);
     const pull = (cx, force) =>
@@ -101,6 +104,58 @@ export default class Prs {
     });
   }
 
+  /** Every worktree under ~/worktrees, read again now. */
+  loadTrees(cx) {
+    cx.spawn(async (cx) => {
+      try {
+        const { home } = await hub.install();
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-worktree.py`, "--list"], { timeout: 60000 });
+        this.trees = JSON.parse(r.stdout || "{}").worktrees ?? [];
+      } catch {}
+      cx.notify();
+    });
+  }
+
+  removeTree(cx, t) {
+    cx.spawn(async (cx) => {
+      try {
+        const { home } = await hub.install();
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-worktree.py`, "--remove-path", t.path], { timeout: 120000 });
+        const d = JSON.parse(r.stdout || "{}");
+        notify(d.error ? { title: "Not removed", body: d.error } : { title: "Worktree removed", body: t.path });
+      } catch {}
+      this.loadTrees(cx);
+    });
+  }
+
+  /** The worktrees page: each with its branch, pull request, changes, and buttons to open it in a tab or remove it. */
+  treesView(k) {
+    const list = this.trees;
+    return v_flex()
+      .gap(10)
+      .child(h_flex().gap(8).items_center().child(div().text_size(TEXT.lg).font_semibold().child(`Worktrees · ${list.length}`)).child(div().flex_1()).child(Button("trees-refresh", { label: "Refresh", icon: "rotate-ccw", variant: "outline", size: "sm", onClick: (_e, cx) => this.loadTrees(cx) })))
+      .child(div().text_size(TEXT.sm).text_color(k.mutedFg).child("Checkouts of pull requests under ~/worktrees, made from a pull request's page. Your own branches and checkouts are not touched."))
+      .children(
+        list.length
+          ? list.map((t) =>
+              h_flex()
+                .id(`tree-${t.name}`)
+                .gap(10)
+                .items_center()
+                .p(12)
+                .rounded(RADIUS.lg)
+                .border_1()
+                .border_color(k.border)
+                .bg(k.card)
+                .child(v_flex().flex_1().min_w(0).gap(2).child(div().font_medium().truncate().child(t.name)).child(Mono(`${t.branch} · ${t.head}${t.pr ? ` · PR #${t.pr}` : ""}${t.at ? ` · ${ago(t.at)} ago` : ""}`, { size: TEXT.xs, color: k.mutedFg })).child(div().text_size(TEXT.xs).text_color(k.dim).child(t.path)))
+                .child(t.dirty ? Badge(`${t.dirty} changed`, "warning") : Badge("clean", "success"))
+                .child(Button(`tree-open-${t.name}`, { label: "Open in a tab", icon: "folder", size: "sm", variant: "outline", onClick: () => { run("tab.new", { name: t.name, folder: t.path }); run("layout.select", { stack: "center", child: "work" }); } }))
+                .child(Button(`tree-rm-${t.name}`, { label: "Remove", size: "sm", variant: "ghost", onClick: (_e, cx) => this.removeTree(cx, t) })),
+            )
+          : [Empty({ icon: "git-fork", title: "No worktrees", description: "Open a pull request and pick “Explore in a worktree”." })],
+      );
+  }
+
   /** A worktree of the pull request's head (bin/cockpit-worktree.py), opened in a new tab to read and run its code. */
   worktree(cx, p, remove = false) {
     cx.spawn(async (cx) => {
@@ -122,6 +177,7 @@ export default class Prs {
       } catch (e) {
         notify({ title: "No worktree", body: String(e?.message ?? e).slice(0, 160) });
       }
+      this.loadTrees(cx);
       cx.notify();
     });
   }
@@ -232,6 +288,8 @@ export default class Prs {
   }
 
   pill(k, p) {
+    const hot = urgent(p);
+    if (hot) return div().flex_none().px(6).h(16).flex().items_center().rounded(4).text_size(9.5).font_semibold().bg(alpha(k[hot.tone], 0.2)).text_color(k[hot.tone]).child(hot.label);
     const t = p.turn;
     if (!t || t.who === "none") return null;
     const label = t.who === "you" ? { review: "REVIEW", "re-review": "RE-REVIEW", ci: "FIX CI", changes: "YOUR MOVE", comments: "YOUR MOVE", merge: "MERGE", draft: "DRAFT", reviewers: "ASK REVIEWERS" }[t.why] ?? "YOUR MOVE" : t.why === "re-requested" ? "WAITING · RE-REQUESTED" : "WAITING";
@@ -388,7 +446,7 @@ export default class Prs {
             .child(div().px(10).pt(6).text_size(TEXT.xs).font_semibold().text_color(k.dim).child(`${title} · ${items.length}`))
             .children(items.map((p) => this.row(k, p)))
         : null;
-    const order = (a, b) => (b.turn?.who === "you") - (a.turn?.who === "you") || b.last_activity - a.last_activity;
+    const order = (a, b) => (urgency(b) - urgency(a)) || (b.turn?.who === "you") - (a.turn?.who === "you") || b.last_activity - a.last_activity;
     // Home's "Details" leaves the pull request to open in this shared value.
     const want = shared("cockpit.prs.focus");
     if (want && want !== this.focused) {
@@ -400,11 +458,11 @@ export default class Prs {
     const allTheirs = [...(d?.assigned ?? [])].filter((p) => p.turn?.who !== "none").sort(order);
     const repos = [...new Set([...allMine, ...allTheirs].map((p) => p.repo))].sort();
     const inRepo = (p) => !this.repoF || p.repo === this.repoF;
-    const mine = this.scope === "review" ? [] : allMine.filter(inRepo);
-    const theirs = this.scope === "mine" ? [] : allTheirs.filter(inRepo);
+    const mine = this.scope === "review" || this.scope === "trees" ? [] : allMine.filter(inRepo);
+    const theirs = this.scope === "mine" || this.scope === "trees" ? [] : allTheirs.filter(inRepo);
     const filters = v_flex()
       .gap(8)
-      .child(Tabs("prs-scope", { value: this.scope, onChange: (v, cx) => ((this.scope = v), cx.notify()), items: [{ value: "all", label: "All", count: allMine.length + allTheirs.length }, { value: "mine", label: "Mine", count: allMine.length }, { value: "review", label: "To review", count: allTheirs.length }] }))
+      .child(Tabs("prs-scope", { value: this.scope, onChange: (v, cx) => ((this.scope = v), cx.notify()), items: [{ value: "all", label: "All", count: allMine.length + allTheirs.length }, { value: "mine", label: "Mine", count: allMine.length }, { value: "review", label: "To review", count: allTheirs.length }, { value: "trees", label: "Worktrees", count: this.trees.length }] }))
       .child(h_flex().gap(6).flex_wrap().children([Chip("all repos", { id: "prs-repo-all", color: this.repoF ? undefined : k.ring, onClick: (_e, cx) => ((this.repoF = null), cx.notify()) }), ...repos.map((r) => Chip(r.split("/")[1], { id: `prs-repo-${r}`, color: this.repoF === r ? k.ring : undefined, onClick: (_e, cx) => ((this.repoF = this.repoF === r ? null : r), cx.notify()) }))]));
     const sel = list.find((p) => keyOf(p) === this.sel) ?? null;
     const yours = list.filter((p) => p.turn?.who === "you").length;
@@ -435,7 +493,7 @@ export default class Prs {
                 .px(24)
                 .py(16)
                 .child(v_flex().id("prs-list").w(380).flex_none().min_h(0).gap(10).overflow_y_scrollbar().children([filters, group("Your pull requests", mine), group("Waiting for your review", theirs)].filter(Boolean)))
-                .child(v_flex().id("prs-detail-scroll").flex_1().min_w(0).min_h(0).overflow_y_scrollbar().child(sel ? this.detail(k, sel, cx) : Empty({ icon: "git-pull-request", title: "Pick a pull request", description: "Its reviewers, CI and an agent to work on it show here." }))),
+                .child(v_flex().id("prs-detail-scroll").flex_1().min_w(0).min_h(0).overflow_y_scrollbar().child(this.scope === "trees" ? this.treesView(k) : sel ? this.detail(k, sel, cx) : Empty({ icon: "git-pull-request", title: "Pick a pull request", description: "Its reviewers, CI and an agent to work on it show here." }))),
       );
   }
 }
