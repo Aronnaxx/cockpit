@@ -453,6 +453,10 @@ export default class Sidebar {
       );
   }
 
+  sectionOpen(name) {
+    return sectionOpen(name);
+  }
+
   /** The header: Usage, Machines and OMO presets, each its own foldable section with a one-line summary when folded. */
   headerBlock(k, model) {
     const hasQuota = Boolean(this.usage?.agents?.length) || Boolean(model.value?.quota?.length);

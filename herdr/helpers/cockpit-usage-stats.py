@@ -2,7 +2,7 @@
 """
 cockpit-usage-stats.py [--days N]
 Where the tokens went in the last N days (7 by default), for the Usage tab, read from each agent's own session data:
-  sessions  the biggest sessions across Claude Code, Codex and OpenCode: tokens (input + output + reasoning, cached
+  sessions  the biggest sessions across Claude Code, Codex, Antigravity and OpenCode: tokens (input + output + reasoning, cached
             input counted apart), turns, cost where the agent records one, and the folder they ran in
   eaters    what fills a context window, per agent: the output of each tool, the model's reasoning, its text, your
             prompts, as tokens estimated at 4 characters each
@@ -141,6 +141,37 @@ def codex():
     return sessions, top(eaters)
 
 
+def antigravity():
+    sessions, eaters = [], defaultdict(lambda: {"chars": 0, "calls": 0})
+    for f in glob.glob(os.path.expanduser("~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl")):
+        if os.path.getmtime(f) < SINCE:
+            continue
+        total, cached, turns, title = 0, 0, 0, None
+        try:
+            for line in open(f, encoding="utf-8", errors="ignore"):
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                total += (e.get("input_tokens") or 0) + (e.get("output_tokens") or 0)
+                cached += e.get("cache_read_tokens") or 0
+                text = e.get("content") or ""
+                t = e.get("type")
+                if t == "USER_INPUT":
+                    turns += 1
+                    title = title or clean_title(re.sub(r"</?USER_REQUEST>", " ", text))
+                    bump(eaters, "your prompts", len(text))
+                elif t == "PLANNER_RESPONSE":
+                    bump(eaters, "model text", len(text))
+                elif t:
+                    bump(eaters, str(t).lower(), len(text if isinstance(text, str) else json.dumps(text)))
+        except Exception:
+            continue
+        if total:
+            sessions.append({"agent": "antigravity", "id": os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(f)))), "title": title, "project": None, "tokens": total, "cached": cached, "turns": turns, "at": int(os.path.getmtime(f) * 1000)})
+    return sessions, top(eaters)
+
+
 def opencode():
     db = os.path.expanduser("~/.local/share/opencode/opencode.db")
     if not os.path.exists(db):
@@ -182,7 +213,7 @@ def main():
     except Exception:
         pass
     sessions, eaters = [], {}
-    for name, fn in (("claude", claude), ("codex", codex), ("opencode", opencode)):
+    for name, fn in (("claude", claude), ("codex", codex), ("antigravity", antigravity), ("opencode", opencode)):
         try:
             s, e = fn()
         except Exception:
@@ -196,7 +227,7 @@ def main():
         by[s["agent"]]["cached"] += s["cached"]
         by[s["agent"]]["sessions"] += 1
     # The five biggest of each agent, for its own column.
-    per = {a: [s for s in sessions if s["agent"] == a][:5] for a in ("claude", "codex", "opencode")}
+    per = {a: [s for s in sessions if s["agent"] == a][:5] for a in ("claude", "codex", "antigravity", "opencode")}
     result = {"at": int(NOW * 1000), "days": DAYS, "sessions": sessions[:10], "per_agent": per, "by_agent": by, "eaters": eaters}
     os.makedirs(CACHE, exist_ok=True)
     with open(OUT + ".tmp", "w") as f:
