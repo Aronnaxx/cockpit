@@ -73,6 +73,9 @@ export default class Prs {
     // The model that explains a pull request and why a comment was made: any of the gateway's, remembered.
     this.explainModel = new ModelPicker(cx, { placeholder: "Search the gateway's models", store: "cockpit.explain.model" });
     this.drafts.modelOf = () => this.explainModel.value();
+    this.jobs = new Map(); // "explain:<key>" | "quiz:<key>" -> {kind, p, model, at}: running in the background
+    cx.timer.every(3000, (cx) => this.pollJobs(cx));
+    cx.timer.every(30000, (cx) => this.autoJobs(cx));
     this.quiz = new Map(); // key -> the quiz (bin/cockpit-explain.py quiz) with your answers | "loading" | {error}
     this.explain = new Map(); // key -> the explanation (bin/cockpit-explain.py) | "loading" | {error}
     // The review drafts on disk (what "In progress" lists with the agents working on a PR): key -> {comments, verdict}.
@@ -87,6 +90,7 @@ export default class Prs {
         cx.notify();
         await loadPrs({ force });
         this.cfg = await prsConfig();
+        if (!this.explainModel.value()) this.explainModel.input.set_value(this.jobModel());
         this.busy = null;
         if (this.docked && !this.dockedOpen) {
           const hit = this.list().find((x) => keyOf(x) === this.docked);
@@ -164,6 +168,14 @@ export default class Prs {
     if (this.explain.has(keyOf(p))) return;
     cx.spawn(async (cx) => {
       const { home } = await hub.install();
+      // Still being written (a job this page or another started): followed until its marker goes.
+      const base = `${home}/.cache/cockpit/explain/${p.repo.replace("/", "__")}__${p.number}.json`;
+      const running = await readTextFile(`${base}.running`).catch(() => null);
+      if (running !== null) {
+        this.explain.set(keyOf(p), "loading");
+        this.jobs.set(`explain:${keyOf(p)}`, { kind: "explain", p, model: JSON.parse(running || "{}").model, at: 0 });
+        return cx.notify();
+      }
       const text = await readTextFile(`${home}/.cache/cockpit/explain/${p.repo.replace("/", "__")}__${p.number}.json`).catch(() => null);
       if (text && !this.explain.has(keyOf(p))) {
         try {
@@ -182,21 +194,79 @@ export default class Prs {
     });
   }
 
-  /** Asks the picked gateway model to explain the pull request (bin/cockpit-explain.py pr); a few minutes on a big one. */
-  writeExplain(cx, p) {
-    const model = this.explainModel.value();
-    if (!model) return notify({ title: "Pick a model first", body: "Any of the gateway's models explains it." });
-    this.explain.set(keyOf(p), "loading");
+  /** The explaining model: the one picked, else explain.model in the cockpit config (Gemini Flash: cheap enough to run unasked). */
+  jobModel() {
+    return this.explainModel.value() || this.cfg?.explain?.model || "agy/gemini-3.8-flash-medium";
+  }
+
+  /** An explanation or a quiz (bin/cockpit-explain.py), detached: it keeps going when you leave the page, and any copy of the page
+   *  sees it through its marker file. */
+  startJob(cx, kind, p, model = this.jobModel()) {
+    const map = kind === "quiz" ? this.quiz : this.explain;
+    map.set(keyOf(p), "loading");
+    this.jobs.set(`${kind}:${keyOf(p)}`, { kind, p, model, at: Date.now() });
     cx.notify();
+    cx.spawn(async () => {
+      const { home } = await hub.install();
+      const q = (x) => `'${String(x).replace(/'/g, "'\\''")}'`;
+      await exec("sh", ["-c", `nohup python3 ${q(`${home}/.local/share/cockpit/herdr/helpers/cockpit-explain.py`)} ${kind === "quiz" ? "quiz" : "pr"} ${q(p.repo)} ${p.number} ${q(model)} >/dev/null 2>&1 &`]).catch(() => {});
+    });
+  }
+
+  /** Jobs still running: done when their marker is gone (the result, or the error, is then read). */
+  pollJobs(cx) {
+    if (!this.jobs.size) return;
     cx.spawn(async (cx) => {
-      try {
-        const { home } = await hub.install();
-        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-explain.py`, "pr", p.repo, String(p.number), model], { timeout: 600000 });
-        this.explain.set(keyOf(p), JSON.parse(r.stdout || "{}"));
-      } catch (e) {
-        this.explain.set(keyOf(p), { error: String(e?.message ?? e).slice(0, 200) });
+      const { home } = await hub.install();
+      for (const [id, j] of [...this.jobs]) {
+        if (Date.now() - j.at < 2500) continue;
+        const base = `${home}/.cache/cockpit/${j.kind === "quiz" ? "quiz" : "explain"}/${j.p.repo.replace("/", "__")}__${j.p.number}.json`;
+        if ((await readTextFile(`${base}.running`).catch(() => null)) !== null) continue;
+        const map = j.kind === "quiz" ? this.quiz : this.explain;
+        const err = await readTextFile(`${base}.error`).catch(() => null);
+        const text = await readTextFile(base).catch(() => null);
+        try {
+          const e = err ? JSON.parse(err) : null;
+          const d = text ? JSON.parse(text) : null;
+          if (e && (!d || e.at > (d.at ?? 0))) map.set(keyOf(j.p), { error: e.error });
+          else if (d) {
+            map.set(keyOf(j.p), d);
+            if (j.kind === "quiz") for (const q of d.questions ?? []) if (q.path) this.drafts.ensureFile(cx, j.p, q.path);
+          } else map.set(keyOf(j.p), { error: "it stopped without an answer" });
+        } catch {
+          map.set(keyOf(j.p), { error: "its answer could not be read" });
+        }
+        this.jobs.delete(id);
+        cx.notify();
       }
-      cx.notify();
+    });
+  }
+
+  /** Without being asked: an explanation for the pull request you open, and an explanation and a quiz for every one with a
+   *  review draft whose agent has finished (explain.auto in the cockpit config, on unless false). Two at a time. */
+  autoJobs(cx, opened = null) {
+    if (this.docked || this.cfg?.explain?.auto === false) return;
+    cx.spawn(async (cx) => {
+      const { home } = await hub.install();
+      const have = async (dir) => new Set(((await exec("ls", [`${home}/.cache/cockpit/${dir}`]).catch(() => ({ stdout: "" }))).stdout ?? "").split("\n"));
+      const [ex, qz] = [await have("explain"), await have("quiz")];
+      const name = (p) => `${p.repo.replace("/", "__")}__${p.number}.json`;
+      const busy = () => this.jobs.size >= 2;
+      const working = this.agentsOn();
+      const want = [];
+      if (opened) want.push(["explain", opened]);
+      for (const p of this.list()) {
+        const d = this.draftInfo.get(keyOf(p));
+        if (!d?.comments || (working.get(keyOf(p)) ?? []).some((a) => a.status === "working")) continue;
+        want.push(["explain", p], ["quiz", p]);
+      }
+      for (const [kind, p] of want) {
+        if (busy()) break;
+        const set = kind === "quiz" ? qz : ex;
+        const map = kind === "quiz" ? this.quiz : this.explain;
+        if (set.has(name(p)) || set.has(`${name(p)}.running`) || set.has(`${name(p)}.error`) || this.jobs.has(`${kind}:${keyOf(p)}`) || map.get(keyOf(p)) === "loading") continue;
+        this.startJob(cx, kind, p);
+      }
     });
   }
 
@@ -212,6 +282,7 @@ export default class Prs {
     if (!this.convo.has(keyOf(p))) this.readConvo(cx, p);
     this.drafts.load(cx, p).then((c) => c && cx.notify());
     this.loadQuiz(cx, p);
+    this.autoJobs(cx, p);
     if (p.role === "author" && (p.behind ?? 0) > 0) this.checkMerge(cx, p);
     const url = p.ci?.builds?.[0];
     if (url && !this.ci.has(url)) {
@@ -587,6 +658,14 @@ export default class Prs {
     if (this.quiz.has(keyOf(p))) return;
     cx.spawn(async (cx) => {
       const { home } = await hub.install();
+      // Still being written (a job this page or another started): followed until its marker goes.
+      const base = `${home}/.cache/cockpit/quiz/${p.repo.replace("/", "__")}__${p.number}.json`;
+      const running = await readTextFile(`${base}.running`).catch(() => null);
+      if (running !== null) {
+        this.quiz.set(keyOf(p), "loading");
+        this.jobs.set(`quiz:${keyOf(p)}`, { kind: "quiz", p, model: JSON.parse(running || "{}").model, at: 0 });
+        return cx.notify();
+      }
       const text = await readTextFile(`${home}/.cache/cockpit/quiz/${p.repo.replace("/", "__")}__${p.number}.json`).catch(() => null);
       if (text && !this.quiz.has(keyOf(p))) {
         try {
@@ -601,22 +680,11 @@ export default class Prs {
 
   /** A new quiz from the picked gateway model (bin/cockpit-explain.py quiz): the change and the draft's comments. */
   writeQuiz(cx, p) {
-    const model = this.explainModel.value();
-    if (!model) return notify({ title: "Pick a model first", body: "Any of the gateway's models writes the quiz." });
-    this.quiz.set(keyOf(p), "loading");
-    cx.notify();
-    cx.spawn(async (cx) => {
-      try {
-        const { home } = await hub.install();
-        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-explain.py`, "quiz", p.repo, String(p.number), model], { timeout: 600000 });
-        const d = JSON.parse(r.stdout || "{}");
-        this.quiz.set(keyOf(p), d);
-        for (const q of d.questions ?? []) if (q.path) this.drafts.ensureFile(cx, p, q.path);
-      } catch (e) {
-        this.quiz.set(keyOf(p), { error: String(e?.message ?? e).slice(0, 200) });
-      }
-      cx.notify();
-    });
+    this.startJob(cx, "quiz", p);
+  }
+
+  writeExplain(cx, p) {
+    this.startJob(cx, "explain", p);
   }
 
   /** Your answer, kept in the quiz's file so the score stays. */

@@ -16,7 +16,7 @@ const WINDOW_LABEL = { "5h": "5-hour session", "7d": "Weekly" };
 /** Runs the sync (it answers from its cache while fresh) and reads what it wrote. force asks every agent again. */
 export async function syncUsage({ force = false } = {}) {
   const { cache, home } = await hub.install();
-  const script = `${home}/.local/share/cockpit/herdr/bin/cockpit-usage-sync.py`;
+  const script = `${home}/.local/share/cockpit/herdr/helpers/cockpit-usage-sync.py`;
   await exec("python3", force ? [script, "--force"] : [script], { timeout: 90000 }).catch(() => null);
   const text = await readTextFile(`${cache}/agent-usage.json`);
   return text ? JSON.parse(text) : null;
@@ -174,6 +174,20 @@ export default class Usage {
     pullStats(cx, false);
     cx.timer.every(600000, (cx) => pullStats(cx, false));
     this.pullStats = pullStats;
+    this.slots = null;
+    const pullSlots = (cx) =>
+      cx.spawn(async (cx) => {
+        try {
+          const { home } = await hub.install();
+          const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-slots.py`], { timeout: 40000 });
+          this.slots = JSON.parse(r.stdout || "{}");
+        } catch (e) {
+          this.slots = { error: String(e?.message ?? e).slice(0, 160) };
+        }
+        cx.notify();
+      });
+    pullSlots(cx);
+    cx.timer.every(15000, (cx) => pullSlots(cx));
     this.follow = followUsage(cx, (data, cx) => {
       this.data = data;
       this.refreshing = false;
@@ -234,72 +248,114 @@ export default class Usage {
     });
   }
 
-  /** The biggest sessions of the last days, and per agent what fills its context windows. */
-  statsCards(k) {
-    const st = this.stats;
-    if (!st?.sessions?.length) return null;
-    const tk = tokensText;
-    const label = { claude: "Claude Code", codex: "Codex", opencode: "OpenCode" };
-    const max = Math.max(1, ...st.sessions.map((s) => s.tokens));
-    const sessions = Card({
-      id: "stats-sessions",
-      padding: 16,
-      gap: 10,
-      title: `Biggest sessions · last ${st.days} days`,
+  /** What a tool's output or a kind of content is, for the colours (as in Claude's own /context). */
+  kindOf(name) {
+    const n = String(name).toLowerCase();
+    if (n === "reasoning") return "Reasoning";
+    if (n === "model text") return "Model text";
+    if (n === "your prompts") return "Your prompts";
+    if (/webfetch|websearch|web_search|fetch|search/.test(n)) return "Web and search";
+    if (/^mcp__/.test(n)) return "MCP tools";
+    if (/bash|shell|exec|sleep|terminal|command/.test(n)) return "Shell";
+    if (/read|glob|grep|list|view|edit|write|patch|file/.test(n)) return "Files";
+    return "Other tools";
+  }
+
+  /** OpenCode has no account limit: what limits it is the local model servers, each serving a fixed number of requests at once
+   * (bin/cockpit-slots.py, from sparkDash). */
+  openCodeCard(k) {
+    const sl = this.slots;
+    const hosts = sl?.hosts ?? [];
+    return Card({
+      id: "usage-card-opencode",
+      padding: 18,
+      gap: 12,
       children: [
-        ...st.sessions.map((s, i) =>
-          v_flex()
-            .id(`stat-s-${i}`)
-            .gap(3)
-            .tooltip(`${label[s.agent] ?? s.agent}${s.project ? ` · ${s.project}` : ""}\n${tk(s.tokens)} tokens (input, output and reasoning) plus ${tk(s.cached)} read from cache${s.cost ? ` · $${s.cost.toFixed(2)}` : ""}${s.agents > 1 ? ` · ${s.agents} agent sessions` : ""}`)
-            .child(
+        h_flex().gap(6).items_center().child(Icon("bot", { size: 13, color: k.mutedFg })).child(div().text_size(TEXT.sm).font_medium().text_color(k.foreground).child("OpenCode")),
+        div().text_size(TEXT.xs).text_color(k.dim).child("No account limit. The local models serve a fixed number of requests at once:"),
+        ...(!sl ? [h_flex().gap(8).items_center().child(Spinner({ size: 12 })).child(div().text_size(TEXT.xs).text_color(k.mutedFg).child("Asking sparkDash…"))] : sl.error ? [div().text_size(TEXT.xs).text_color(k.warning).child(sl.error)] : []),
+        ...hosts.map((h) => {
+          const busy = h.total ? h.active / h.total : 0;
+          const tone = !h.online ? k.dim : busy >= 1 ? k.destructive : busy >= 0.5 ? k.warning : k.success;
+          return v_flex().id(`slots-${h.id}`).gap(4)
+            .tooltip(`${h.model ?? "no model loaded"}${h.quant ? ` · ${h.quant}` : ""}${h.context ? ` · ${Math.round(h.context / 1024)}k context` : ""}`)
+            .child(h_flex().gap(8).items_center()
+              .child(div().size(7).rounded(4).flex_none().bg(h.online ? k.success : k.dim))
+              .child(div().flex_1().min_w(0).truncate().text_size(TEXT.sm).text_color(k.foreground).child(h.name))
+              .child(Mono(h.online ? `${h.active}/${h.total} slots` : "offline", { size: TEXT.xs, color: h.online ? k.foreground : k.dim })))
+            .child(h_flex().gap(2).children(Array.from({ length: Math.max(1, h.total) }, (_, i) => div().flex_1().h(6).rounded(3).bg(i < h.active ? tone : alpha(k.muted, 0.9)))))
+            .child(div().text_size(TEXT.xs).text_color(k.dim).truncate().child([h.model, h.waiting ? `${h.waiting} queued` : null, h.tps ? `${Math.round(h.tps)} tok/s` : null].filter(Boolean).join(" · ")));
+        }),
+        h_flex().pt(2).border_t_1().border_color(k.border).child(div().text_size(TEXT.xs).text_color(k.dim).child(sl?.at ? `sparkDash · asked ${dur(this.now - sl.at)} ago` : "sparkDash")),
+      ],
+    });
+  }
+
+  /** One agent's column below its limits: its biggest sessions, then a colour-coded breakdown of what filled its context. */
+  agentStats(k, key) {
+    const st = this.stats;
+    if (!st) return [null, null];
+    const tk = tokensText;
+    const COLORS = { Files: "#5b8def", Shell: "#e0803f", "Web and search": "#4fae93", "MCP tools": "#d6a03c", Reasoning: "#a278e0", "Model text": "#7fb069", "Your prompts": "#e07aa0", "Other tools": "#8a8f98" };
+    const out = [null, null];
+    const list = st.per_agent?.[key] ?? [];
+    if (list.length) {
+      const max = Math.max(1, ...list.map((s) => s.tokens));
+      out[0] = (
+        Card({
+          id: `stats-sessions-${key}`,
+          padding: 14,
+          gap: 8,
+          title: `Biggest sessions · ${st.days} days`,
+          children: [
+            ...list.map((s, i) =>
+              v_flex()
+                .id(`stat-s-${key}-${i}`)
+                .gap(3)
+                .tooltip(`${s.project ? `${s.project}\n` : ""}${tk(s.tokens)} tokens (input, output and reasoning) plus ${tk(s.cached)} read from cache${s.cost ? ` · $${s.cost.toFixed(2)}` : ""}${s.agents > 1 ? ` · ${s.agents} agent sessions` : ""}`)
+                .child(h_flex().gap(8).items_center().child(div().flex_1().min_w(0).truncate().text_size(TEXT.sm).text_color(k.foreground).child(s.title ?? s.id)).child(Mono(tk(s.tokens), { color: k.foreground })))
+                .child(Progress(s.tokens / max, { color: k.mutedFg, h: 4 })),
+            ),
+            div().text_size(TEXT.xs).text_color(k.dim).child(`${tk(st.by_agent?.[key]?.tokens ?? 0)} over ${st.by_agent?.[key]?.sessions ?? 0} sessions · ${tk(st.by_agent?.[key]?.cached ?? 0)} read from cache`),
+          ],
+        })
+      );
+    }
+    const eaters = st.eaters?.[key] ?? [];
+    if (eaters.length) {
+      const total = eaters.reduce((n, x) => n + x.tokens, 0) || 1;
+      out[1] = (
+        Card({
+          id: `stats-eaters-${key}`,
+          padding: 14,
+          gap: 10,
+          title: "What fills the context",
+          children: [
+            div().text_size(TEXT.xs).text_color(k.dim).child(`about ${tk(total)} tokens over ${st.days} days`),
+            h_flex()
+              .id(`stat-bar-${key}`)
+              .w_full()
+              .h(8)
+              .gap(1)
+              .rounded(4)
+              .overflow_hidden()
+              .children(eaters.map((x) => div().h_full().w(`${Math.max(1.5, (x.tokens / total) * 100)}%`).bg(COLORS[this.kindOf(x.name)]))),
+            ...eaters.map((x, i) =>
               h_flex()
+                .id(`stat-e-${key}-${i}`)
                 .gap(8)
                 .items_center()
-                .child(div().w(78).flex_none().text_size(TEXT.xs).text_color(k.mutedFg).child(label[s.agent] ?? s.agent))
-                .child(div().flex_1().min_w(0).truncate().text_size(TEXT.sm).text_color(k.foreground).child(s.title ?? s.id))
-                .child(Mono(tk(s.tokens), { color: k.foreground })),
-            )
-            .child(div().pl(86).child(Progress(s.tokens / max, { color: s.agent === "claude" ? k.warning : s.agent === "codex" ? k.info : k.success, h: 4 }))),
-        ),
-        h_flex()
-          .gap(14)
-          .flex_wrap()
-          .pt(4)
-          .children(Object.entries(st.by_agent ?? {}).map(([a, v]) => div().text_size(TEXT.xs).text_color(k.dim).child(`${label[a] ?? a}: ${tk(v.tokens)} over ${v.sessions} sessions · ${tk(v.cached)} cached`))),
-      ],
-    });
-    const eaters = Card({
-      id: "stats-eaters",
-      padding: 16,
-      gap: 12,
-      title: "What fills the context",
-      children: [
-        div().text_size(TEXT.xs).text_color(k.dim).child("Estimated tokens of what each agent's sessions took in: tool output, its own reasoning and text, your prompts"),
-        ...Object.entries(st.eaters ?? {})
-          .filter(([, e]) => e.length)
-          .map(([a, e]) => {
-            const m = Math.max(1, ...e.map((x) => x.tokens));
-            return v_flex()
-              .id(`stat-e-${a}`)
-              .gap(4)
-              .child(div().text_size(TEXT.sm).font_medium().text_color(k.foreground).child(label[a] ?? a))
-              .children(
-                e.map((x, i) =>
-                  h_flex()
-                    .id(`stat-e-${a}-${i}`)
-                    .gap(8)
-                    .items_center()
-                    .tooltip(`${x.name}: ${x.calls} calls, about ${tk(x.tokens)} tokens`)
-                    .child(div().w(150).flex_none().truncate().text_size(TEXT.xs).text_color(k.mutedFg).child(x.name))
-                    .child(div().flex_1().child(Progress(x.tokens / m, { color: k.working, h: 5 })))
-                    .child(div().w(46).flex_none().text_right().child(Mono(tk(x.tokens), { size: TEXT.xs, color: k.foreground }))),
-                ),
-              );
-          }),
-      ],
-    });
-    return div().w_full().flex().flex_row().flex_wrap().gap(16).child(div().min_w(380).flex_1().child(sessions)).child(div().min_w(380).flex_1().child(eaters));
+                .tooltip(`${x.name}: ${x.calls} calls · ${this.kindOf(x.name)}`)
+                .child(div().size(10).flex_none().rounded(2).bg(COLORS[this.kindOf(x.name)]))
+                .child(div().flex_1().min_w(0).truncate().text_size(TEXT.xs).text_color(k.mutedFg).child(x.name))
+                .child(div().w(44).flex_none().text_right().child(Mono(tk(x.tokens), { size: TEXT.xs, color: k.foreground })))
+                .child(div().w(40).flex_none().text_right().text_size(TEXT.xs).text_color(k.dim).child(`${Math.round((x.tokens / total) * 100)}%`)),
+            ),
+          ],
+        })
+      );
+    }
+    return out;
   }
 
   render(cx) {
@@ -310,7 +366,17 @@ export default class Usage {
       ? h_flex().h(160).justify_center().items_center().gap(8).text_color(k.mutedFg).child(Spinner({ size: 14 })).child("Asking the agents for their limits…")
       : !agents.length
         ? Empty({ icon: "gauge", title: "No agent usage yet", description: "Claude Code, Codex and Antigravity show up once they are installed and signed in." })
-        : div().w_full().flex().flex_row().flex_wrap().gap(16).children(agents.map((a) => div().min_w(320).flex_1().child(this.agentCard(k, a))));
+        : (() => {
+            // Rows, not columns: every agent's limits side by side, then their biggest sessions, then what fills their context, so
+            // each row's cards line up and share a height.
+            const cols = [...agents.map((a) => ({ id: a.id, card: this.agentCard(k, a) })), { id: "opencode", card: this.openCodeCard(k) }];
+            const stats = Object.fromEntries(cols.map((c) => [c.id, this.agentStats(k, c.id)]));
+            const row = (id, cells) => h_flex().id(id).w_full().gap(16).items_stretch().children(cells.map((c, i) => v_flex().id(`${id}-${i}`).flex_1().min_w(0).children(c ? [c.flex_1()] : [])));
+            const rows = [row("usage-row-limits", cols.map((c) => c.card))];
+            if (cols.some((c) => stats[c.id][0])) rows.push(row("usage-row-sessions", cols.map((c) => stats[c.id][0])));
+            if (cols.some((c) => stats[c.id][1])) rows.push(row("usage-row-context", cols.map((c) => stats[c.id][1])));
+            return v_flex().w_full().gap(16).children(rows);
+          })();
     return v_flex()
       .id("usage")
       .size_full()
@@ -339,7 +405,6 @@ export default class Usage {
           .gap(16)
           .overflow_y_scrollbar()
           .child(body)
-          .when(Boolean(this.stats?.sessions?.length), (e) => e.child(this.statsCards(k)))
           .when(Boolean(this.data?.updated_at), (e) => e.child(div().text_size(TEXT.xs).text_color(k.dim).child(`Updated ${dur(this.now - this.data.updated_at)} ago · Claude from Anthropic's usage endpoint, Codex from its app-server, Antigravity from agy /quota`))),
       );
   }

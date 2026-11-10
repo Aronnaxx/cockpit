@@ -95,7 +95,8 @@ def counted(d, stats):
     """The lines added and removed per area, from the diff; files no area names go under "Other"."""
     seen = set()
     for a in d.get("areas") or []:
-        a["files"] = [f for f in a.get("files") or [] if f in stats]
+        # A file is counted once, under the first area that names it.
+        a["files"] = [f for f in dict.fromkeys(a.get("files") or []) if f in stats and f not in seen]
         seen.update(a["files"])
         a["added"] = sum(stats[f][0] for f in a["files"])
         a["removed"] = sum(stats[f][1] for f in a["files"])
@@ -281,15 +282,37 @@ def quiz(slug, number, model):
     return out
 
 
+def marked(kind, slug, number, model, fn):
+    """Runs `fn` with a marker beside its file while it works (<name>.running: {model, pid, at}), so the PR page shows it in
+    progress from any copy, and leaves <name>.error when it fails; meant to run detached (nohup ... &)."""
+    folder = os.path.join(os.path.expanduser("~/.cache/cockpit"), kind)
+    os.makedirs(folder, exist_ok=True)
+    name = os.path.join(folder, f"{slug.replace('/', '__')}__{number}.json")
+    for old in (name + ".error",):
+        if os.path.exists(old):
+            os.remove(old)
+    with open(name + ".running", "w") as f:
+        json.dump({"model": model, "pid": os.getpid(), "at": int(time.time() * 1000)}, f)
+    try:
+        return fn()
+    except Exception as e:
+        with open(name + ".error", "w") as f:
+            json.dump({"error": str(e)[:400], "model": model, "at": int(time.time() * 1000)}, f)
+        raise
+    finally:
+        if os.path.exists(name + ".running"):
+            os.remove(name + ".running")
+
+
 def main():
     a = sys.argv[1:]
     try:
         if len(a) >= 4 and a[0] == "pr":
-            print(json.dumps(explain_pr(a[1], a[2], a[3])))
+            print(json.dumps(marked("explain", a[1], a[2], a[3], lambda: explain_pr(a[1], a[2], a[3]))))
         elif len(a) >= 3 and a[0] == "fill":
             print(json.dumps(fill(a[1], a[2])))
         elif len(a) >= 4 and a[0] == "quiz":
-            print(json.dumps(quiz(a[1], a[2], a[3])))
+            print(json.dumps(marked("quiz", a[1], a[2], a[3], lambda: quiz(a[1], a[2], a[3]))))
         elif len(a) >= 5 and a[0] == "why":
             print(json.dumps(explain_why(a[1], a[2], a[3], a[4])))
         else:
