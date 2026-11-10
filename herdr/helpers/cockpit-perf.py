@@ -352,7 +352,8 @@ def info_opencode(con, session):
         used = (tok.get("input") or 0) + (tok.get("output") or 0) + (tok.get("reasoning") or 0) + ((tok.get("cache") or {}).get("read") or 0) + ((tok.get("cache") or {}).get("write") or 0)
         model = (d.get("model") or {}).get("id")
         if used and model:
-            return {"model": model, "context": ctx(used, window_of(model))}
+            mode = " · ".join(x for x in (d.get("agent"), (d.get("model") or {}).get("variant")) if x and x != "default")
+            return {"model": model, "context": ctx(used, window_of(model)), "mode": mode or d.get("agent")}
     return {}
 
 
@@ -375,6 +376,13 @@ def info_claude(session):
                     break
             except Exception:
                 continue
+    # The permission mode: the last one the transcript records on a prompt.
+    if files:
+        for line in reversed(lines):
+            m = re.search(r'"permissionMode":"([A-Za-z]+)"', line) if '"permissionMode"' in line else None
+            if m:
+                out["mode"] = {"acceptEdits": "accept edits", "bypassPermissions": "bypass", "default": "ask"}.get(m[1], m[1])
+                break
     # The statusline's payload: effort and cost, when it is this session's.
     try:
         s = json.load(open(os.path.join(CACHE, "usage-claude.json")))
@@ -399,7 +407,7 @@ def info_codex(session):
         if '"turn_context"' in line:
             try:
                 p = json.loads(line).get("payload") or {}
-                out = {"model": p.get("model"), "effort": p.get("effort"), "sandbox": (p.get("sandbox_policy") or {}).get("type"), "approval": p.get("approval_policy")}
+                out = {"model": p.get("model"), "effort": p.get("effort"), "sandbox": (p.get("sandbox_policy") or {}).get("type"), "approval": p.get("approval_policy"), "mode": " · ".join(x for x in ((p.get("collaboration_mode") or {}).get("mode"), f"approvals {p.get('approval_policy')}" if p.get("approval_policy") else None) if x)}
                 break
             except Exception:
                 continue

@@ -107,21 +107,23 @@ export default class Sidebar {
       const program = String(row?.program ?? "").toLowerCase();
       const usageId = /claude/.test(program) ? "claude" : /codex/.test(program) ? "codex" : /antigravity|agy|gemini/.test(program) ? "antigravity" : null;
       const windows = (this.usage?.agents ?? []).find((x) => x.id === usageId)?.windows ?? [];
-      const pctOf = (name) => {
-        const ps = windows.filter((w) => w.name === name && (w.source !== "estimate" || w.budget_tokens)).map((w) => w.percent ?? 0);
-        return ps.length ? Math.round(Math.max(...ps)) : null;
+      const winOf = (name) => {
+        const w = windows.filter((x) => x.name === name && (x.source !== "estimate" || x.budget_tokens)).reduce((m, x) => (!m || (x.percent ?? 0) > (m.percent ?? 0) ? x : m), null);
+        return w ? { pct: Math.round(w.percent ?? 0), resets: w.resets_at ?? null } : null;
       };
-      const five = pctOf("5h"), week = pctOf("7d");
-      const worst = Math.max(five ?? 0, week ?? 0);
+      const five = winOf("5h"), week = winOf("7d");
+      const worst = Math.max(five?.pct ?? 0, week?.pct ?? 0);
       const here = this.perf.sys.get(null);
       const presets = [...new Set([...this.omo.by.values()].map((v) => v.preset).filter(Boolean))];
       const ownTps = row ? this.perf.of(row.address) : null;
       const info = row ? this.perf.of(row.address)?.info : null;
       const where = row ? row.address.split("/")[0] : null;
       const status = {
-        usage: five != null || week != null ? { text: [five != null && `5h ${five}%`, week != null && `7d ${week}%`].filter(Boolean).join(" · "), tone: worst >= 95 ? "bad" : worst >= 80 ? "warn" : null } : null,
+        usage: five || week ? { five, week, tone: worst >= 95 ? "bad" : worst >= 80 ? "warn" : null } : null,
+        mode: info?.mode ? { text: info.mode, tone: null } : null,
         machines: here ? { text: `CPU ${Math.round(here.cpu)}%${here.gpu != null ? ` · GPU ${Math.round(here.gpu)}%` : ""}`, tone: here.cpu >= 90 ? "warn" : null } : null,
-        omo: presets.length ? { text: presets.join(" / "), tone: presets.length > 1 ? "warn" : null } : null,
+        // The OMO preset belongs to OpenCode: shown for an OpenCode agent only, the preset of its own machine.
+        omo: /opencode/.test(program) && (this.omo.of(where && where !== row?.address ? where : null)?.preset) ? { text: this.omo.of(where && where !== row?.address ? where : null).preset, tone: null } : null,
         tps: ownTps?.tps ? { text: tpsText(ownTps.tps), tone: Date.now() - (ownTps.at ?? 0) < 60_000 ? "live" : null } : null,
         agent: info?.model ? { text: [info.model_name ?? info.model, info.context?.percent != null ? `${Math.round(info.context.percent)}% ctx` : null, where && where !== row.address ? `on ${where}` : null].filter(Boolean).join(" · "), tone: info.context?.percent >= 85 ? "bad" : info.context?.percent >= 70 ? "warn" : null } : null,
       };

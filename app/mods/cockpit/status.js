@@ -10,7 +10,7 @@ import { run, focused, shared, setShared, layout, readTextFile } from "herdr";
 import * as hub from "./hub.js";
 import { fleet, goToAgent, counts } from "./fleet.js";
 import { show } from "./sidebar.js";
-import { tokens, TEXT, RADIUS, Icon, Spinner, Mono, openMenu } from "./ui.js";
+import { tokens, alpha, dur, TEXT, RADIUS, Icon, Spinner, Mono, openMenu } from "./ui.js";
 
 /** A node of the shown layout by id. */
 export function findNode(node, id) {
@@ -49,13 +49,13 @@ export function togglePanel(name) {
 export default class Status {
   init(_props, cx) {
     // Which of the items between the counts and the agent's links show: `statusbar.items` in the cockpit config.
-    this.items = ["agent", "usage", "machines", "omo", "tps"];
+    this.items = ["agent", "mode", "usage", "machines", "omo", "tps"];
     const readItems = (cx) =>
       cx.spawn(async (cx) => {
         try {
           const { home } = await hub.install();
           const cfg = JSON.parse((await readTextFile(`${home}/.config/cockpit/config.json`)) ?? "{}");
-          const next = (cfg.statusbar?.items ?? this.items).filter((n) => ["agent", "usage", "machines", "omo", "tps"].includes(n));
+          const next = (cfg.statusbar?.items ?? this.items).filter((n) => ["agent", "mode", "usage", "machines", "omo", "tps"].includes(n));
           if (next.join() !== this.items.join()) {
             this.items = next;
             cx.notify();
@@ -212,14 +212,27 @@ export default class Status {
     // The machines, limits, presets and speed, and the focused agent's model: in the room the bar has in the middle.
     const st = shared("cockpit.status") ?? {};
     const toneOf = (s) => (s.tone === "bad" ? k.destructive : s.tone === "warn" ? k.warning : s.tone === "live" ? k.working : k.foreground);
-    const go = { agent: () => togglePanel("context"), usage: () => show("usage"), machines: () => show("machines"), omo: () => show("machines"), tps: undefined };
-    const label = { agent: "Model", usage: "Usage", machines: "Load", omo: "OMO", tps: "Speed" };
-    const tip = { agent: "The focused agent's model and context window  ⌃⌘6", usage: "The highest of every agent's 5h and 7d limits", machines: "This computer's CPU and GPU", omo: "OMO preset of each machine (amber: they differ)", tps: "Tokens per second of the agents answering now" };
-    const room = w >= 1100 ? 5 : w >= 900 ? 3 : w >= 760 ? 1 : 0;
-    const mid = ["agent", "usage", "machines", "omo", "tps"]
+    const go = { agent: () => togglePanel("context"), mode: undefined, usage: () => show("usage"), machines: () => show("machines"), omo: () => show("machines"), tps: undefined };
+    const label = { agent: "Model", mode: "Mode", usage: "Usage", machines: "Load", omo: "OMO", tps: "Speed" };
+    const tip = { agent: "The focused agent's model and context window  ⌃⌘6", mode: "The focused agent's mode: permissions, approvals, or its OpenCode agent", usage: "The focused agent's own 5-hour and weekly limits", machines: "This computer's CPU and GPU", omo: "The OpenCode preset of this agent's machine", tps: "The focused agent's latest speed" };
+    // The limits as bars, as Claude Code's own status line draws them: filled in green, amber from 75%, red from 90%, with the reset.
+    const bar = (name, win) => {
+      const c = win.pct >= 90 ? k.destructive : win.pct >= 75 ? k.warning : k.success;
+      return h_flex().gap(5).items_center()
+        .child(div().text_color(k.dim).child(name))
+        .child(div().relative().w(54).h(8).flex_none().rounded(4).bg(alpha(c, 0.22)).child(div().absolute().left(0).top(0).h_full().rounded(4).bg(c).w(`${Math.min(100, win.pct)}%`)))
+        .child(div().text_color(c).font_medium().child(`${win.pct}%`))
+        .when(Boolean(win.resets), (e) => e.child(div().text_color(k.dim).child(`reset ${dur(win.resets - Date.now())}`)));
+    };
+    const room = w >= 1500 ? 6 : w >= 1300 ? 5 : w >= 1100 ? 4 : w >= 900 ? 3 : w >= 760 ? 1 : 0;
+    const mid = ["agent", "mode", "usage", "machines", "omo", "tps"]
       .filter((n) => this.items.includes(n) && st[n])
       .slice(0, room)
-      .map((n) => item(`st-mid-${n}`, [div().text_color(k.dim).child(label[n]), div().text_color(toneOf(st[n])).child(st[n].text)], { tooltip: tip[n], onClick: go[n] }));
+      .map((n) =>
+        n === "usage"
+          ? item("st-mid-usage", [h_flex().gap(10).items_center().children([st.usage.five && bar("5h", st.usage.five), st.usage.five && st.usage.week && div().w(1).h(12).bg(k.border), st.usage.week && bar("7d", st.usage.week)].filter(Boolean))], { tooltip: tip.usage, onClick: go.usage })
+          : item(`st-mid-${n}`, [div().text_color(k.dim).child(label[n]), div().text_color(toneOf(st[n])).child(st[n].text)], { tooltip: tip[n], onClick: go[n] }),
+      );
 
     return h_flex()
       .id("cockpit-status")

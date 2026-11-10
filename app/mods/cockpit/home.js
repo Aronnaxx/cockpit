@@ -1103,6 +1103,7 @@ export default class Home {
     if (info.model || info.model_name) modelChips.push(Chip(info.model_name ?? info.model, { id: `${card.key}-model`, mono: true, icon: "bot", tooltip: `Model: ${info.model ?? info.model_name}` }));
     const omoHere = /opencode/.test(prog0) ? this.omo.of(machineOf(a?.address)) : null;
     if (omoHere?.preset) modelChips.push(Chip(`preset ${omoHere.preset}`, { id: `${card.key}-preset`, color: k.info, tooltip: `Oh-my-opencode-slim preset in ${machineOf(a?.address) ?? "this computer"}'s config (which model each OMO agent uses). A session already running keeps the preset it started with.` }));
+    if (info.mode) modelChips.push(Chip(info.mode, { id: `${card.key}-mode`, icon: "shield-check", tooltip: "Its mode: permissions or approvals, or the OpenCode agent" }));
     if (info.effort) modelChips.push(Chip(`${info.effort} effort`, { id: `${card.key}-effort`, tooltip: "Reasoning effort" }));
     if (info.sandbox) modelChips.push(Chip(`${info.sandbox}${info.approval ? ` · approvals ${info.approval}` : ""}`, { id: `${card.key}-sandbox`, tooltip: "Sandbox and approval policy" }));
     if (info.cost) modelChips.push(Mono(money(info.cost)));

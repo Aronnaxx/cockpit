@@ -25,7 +25,7 @@ export default class Settings {
     this.spaces = DEFAULT_SPACES;
     this.titles = true;
     this.header = ["usage", "machines", "omo"];
-    this.statusItems = ["agent", "usage", "machines", "omo", "tps"];
+    this.statusItems = ["agent", "mode", "usage", "machines", "omo", "tps"];
     const read = (cx) =>
       cx.spawn(async (cx) => {
         try {
@@ -33,7 +33,7 @@ export default class Settings {
           const cfg = JSON.parse((await readTextFile(`${home}/.config/cockpit/config.json`)) ?? "{}");
           if (Array.isArray(cfg.spaces)) this.spaces = cfg.spaces.map((s) => (typeof s === "string" ? s : s.name));
           this.titles = cfg.titles?.enabled !== false;
-          this.statusItems = (cfg.statusbar?.items ?? this.statusItems).filter((n) => ["agent", "usage", "machines", "omo", "tps"].includes(n));
+          this.statusItems = (cfg.statusbar?.items ?? this.statusItems).filter((n) => ["agent", "mode", "usage", "machines", "omo", "tps"].includes(n));
           this.header = (cfg.sidebar?.header ?? this.header).filter((x) => SECTIONS.some(([n]) => n === x));
           cx.notify();
         } catch {}
@@ -140,7 +140,7 @@ export default class Settings {
               gap: 10,
               children: [
                 head("Bottom bar", "What shows between the agent counts and the agent's links, as far as the window is wide enough"),
-                v_flex().gap(6).children([["agent", "Focused agent's model", "and its context window"], ["usage", "Usage limit", "the highest of every agent's 5h and 7d windows"], ["machines", "Machine load", "this computer's CPU and GPU"], ["omo", "OMO presets", "amber when the machines differ"], ["tps", "Tokens per second", "of the agents answering now"]].map(([name, label, hint]) => row(`set-st-${name}`, label, hint, Checkbox(`set-st-box-${name}`, { checked: this.statusItems.includes(name), onClick: (_e, cx) => this.setStatusItem(cx, name, !this.statusItems.includes(name)) })))),
+                v_flex().gap(6).children([["agent", "Focused agent's model", "and its context window"], ["mode", "Focused agent's mode", "permissions, approvals, or its OpenCode agent"], ["usage", "Usage limits", "the focused agent's 5h and 7d bars, with their resets"], ["machines", "Machine load", "this computer's CPU and GPU"], ["omo", "OMO preset", "OpenCode agents only"], ["tps", "Speed", "the focused agent's latest tokens per second"]].map(([name, label, hint]) => row(`set-st-${name}`, label, hint, Checkbox(`set-st-box-${name}`, { checked: this.statusItems.includes(name), onClick: (_e, cx) => this.setStatusItem(cx, name, !this.statusItems.includes(name)) })))),
               ],
             }),
           )

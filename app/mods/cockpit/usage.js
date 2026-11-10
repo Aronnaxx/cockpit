@@ -62,9 +62,10 @@ export function usageBadge(data) {
   return p >= 80 ? { count: `${p}%`, tone: p >= 95 ? "destructive" : "warning" } : null;
 }
 
+/** The bar's colour as Claude Code's own status line has it: green, amber from 75% (or when ahead of pace), red from 90%. */
 export function toneOf(k, w) {
   const p = w.percent ?? 0;
-  return p >= 95 ? k.destructive : p >= 80 || w.ahead ? k.warning : k.success;
+  return p >= 90 ? k.destructive : p >= 75 || w.ahead ? k.warning : k.success;
 }
 
 /** When the window hits 100% at its current pace, in ms from now, if that comes before its reset; else null. */
@@ -106,10 +107,10 @@ export function LimitRow(id, w, { compact = false, now = Date.now() } = {}) {
       div()
         .relative()
         .flex_1()
-        .h(compact ? 5 : 7)
-        .rounded(4)
-        .bg(k.muted)
-        .child(div().absolute().left(0).top(0).h_full().rounded(4).bg(tone).w(`${est && !w.budget_tokens ? 0 : p}%`).transition("width", { duration: 400, easing: "ease-out" }))
+        .h(compact ? 6 : 10)
+        .rounded(5)
+        .bg(alpha(tone, 0.2))
+        .child(div().absolute().left(0).top(0).h_full().rounded(5).bg(tone).w(`${est && !w.budget_tokens ? 0 : p}%`).transition("width", { duration: 400, easing: "ease-out" }))
         .when(w.elapsed != null, (e) => e.child(div().absolute().top(-2).h(compact ? 9 : 11).w(2).rounded(1).bg(k.foreground).opacity(0.6).left(`${Math.min(99, w.elapsed * 100)}%`))),
     )
     .child(
