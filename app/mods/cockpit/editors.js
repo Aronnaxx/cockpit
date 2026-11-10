@@ -29,3 +29,21 @@ export async function openInEditor(id, folder) {
     return false;
   }
 }
+
+/** Opens a file of a checkout at a line: VS Code (and its scheme) goes to the line, the others open the file. */
+export async function openFileAt(id, folder, rel, line = 1) {
+  const abs = `${folder}/${rel}`;
+  if (id === "vscode") {
+    try {
+      await exec("open", [`vscode://file${abs}:${line}`], { timeout: 20000 });
+      return true;
+    } catch {}
+  }
+  return openInEditor(id, abs);
+}
+
+/** The pull request's "Files changed" on GitHub at a file (and a line of its new version): its anchor is the SHA-256 of the path. */
+export async function githubFileUrl(p, path, line = null) {
+  const r = await exec("python3", ["-c", "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest())", path], { timeout: 10000 });
+  return `${p.url}/files#diff-${String(r.stdout).trim()}${line ? `R${line}` : ""}`;
+}

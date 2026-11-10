@@ -5,8 +5,9 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState } from "gpui-base";
 import { notify } from "herdr";
 import * as hub from "./hub.js";
-import { tokens, TEXT, Icon, Badge, Button, Card, PageHeader, Empty, Mono, Progress, Sparkline, TextField } from "./ui.js";
+import { tokens, TEXT, Icon, Badge, Button, Card, PageHeader, Empty, Mono, Progress, Sparkline, TextField, Spinner } from "./ui.js";
 import { PerfModel, OmoModel, tpsText, machineOf } from "./agentsui.js";
+import { gatewayModels, gatewayStatus } from "./modelpick.js";
 
 const gb = (mb) => `${(mb / 1024).toFixed(1)} GB`;
 
@@ -17,6 +18,14 @@ export default class Machines {
     this.perf.follow(cx, () => this.rows?.agents);
     this.omo = new OmoModel();
     this.omo.follow(cx);
+    // The LiteLLM gateway: whether it answers, how fast, its models (offered when a preset's models are edited).
+    this.ll = null;
+    this.gw = [];
+    this.focusField = null;
+    const askGateway = (cx) => cx.spawn(async (cx) => { this.ll = await gatewayStatus(); if (this.ll.ok && !this.gw.length) this.gw = await gatewayModels(); cx.notify(); });
+    askGateway(cx);
+    cx.timer.every(20000, askGateway);
+    this.askGateway = askGateway;
     // Which preset of each machine is shown (default: the one in use), the one being edited, its fields, the delete asking twice.
     this.shown = new Map();
     this.edit = null;
@@ -52,7 +61,12 @@ export default class Machines {
   startEdit(key, preset, models) {
     for (const [agent, model] of Object.entries(models)) {
       const id = `${key}|${preset}|${agent}`;
-      if (!this.fields.has(id)) this.fields.set(id, InputState.new({ placeholder: "model > fallback > fallback" }));
+      if (!this.fields.has(id)) {
+        const f = InputState.new({ placeholder: "model > fallback > fallback" });
+        f.on("focus", (_e, cx) => ((this.focusField = id), cx.notify()));
+        f.on("change", (_e, cx) => ((this.focusField = id), cx.notify()));
+        this.fields.set(id, f);
+      }
       this.fields.get(id).set_value(model);
     }
     this.edit = { key, preset };
@@ -105,6 +119,26 @@ export default class Machines {
       .child(div().flex_1().child(Progress((p ?? 0) / 100, { color: tone, h: 6 })))
       .child(div().w(44).flex_none().text_right().child(Mono(`${Math.round(p ?? 0)}%`, { color: k.foreground })))
       .child(div().w(56).flex_none().child((history?.length ?? 0) > 1 ? Sparkline(history, { w: 56, h: 14, color: tone }) : div()));
+  }
+
+  /** The gateway's card: up or down, how fast it answers, how many models it has. */
+  gatewayCard(k) {
+    const l = this.ll;
+    return Card({
+      id: "litellm",
+      padding: 16,
+      gap: 10,
+      title: "LiteLLM gateway",
+      children: [
+        !l
+          ? h_flex().gap(8).items_center().text_color(k.mutedFg).text_size(TEXT.sm).child(Spinner({ size: 12 })).child("Asking the gateway…")
+          : h_flex().gap(8).items_center().child(div().size(8).rounded(4).bg(l.ok ? k.success : k.destructive)).child(div().text_size(TEXT.base).font_semibold().child(l.ok ? "Answering" : "Not answering")).child(div().flex_1()).children(l.ok ? [Badge(`${l.ms} ms`, l.ms > 1500 ? "warning" : "secondary"), Badge(`${l.count} models`, "secondary")] : []),
+        l?.base_url ? Mono(l.base_url, { size: TEXT.xs, color: k.mutedFg }) : null,
+        l && !l.ok && l.error ? div().text_size(TEXT.xs).text_color(k.destructive).whitespace_normal().child(l.error) : null,
+        div().text_size(TEXT.xs).text_color(k.dim).child("Model fields across the cockpit (OMO presets, the PR agents, the walkthrough) offer this gateway's models."),
+        h_flex().child(Button("ll-refresh", { label: "Check again", icon: "rotate-ccw", size: "sm", variant: "outline", onClick: (_e, cx) => this.askGateway(cx) })),
+      ].filter(Boolean),
+    });
   }
 
   machineCard(k, m, s) {
@@ -162,7 +196,12 @@ export default class Machines {
               if (editing) {
                 const id = `${key}|${shown}|${agent}`;
                 if (!this.fields.has(id)) this.startEdit(key, shown, models);
-                return h_flex().id(`omo-${key}-f-${agent}`).gap(10).items_center().child(label).child(TextField(this.fields.get(id)));
+                const field = this.fields.get(id);
+                const tail = field.value().split(">").pop().trim().replace(/^litellm\//, "").toLowerCase();
+                const hits = this.focusField === id ? this.gw.filter((g) => !tail || g.toLowerCase().includes(tail)).slice(0, 8) : [];
+                return v_flex().id(`omo-${key}-f-${agent}`).gap(4)
+                  .child(h_flex().gap(10).items_center().child(label).child(TextField(field)))
+                  .when(hits.length > 0, (e) => e.child(h_flex().gap(4).flex_wrap().pl(106).children(hits.map((g) => Button(`omo-${key}-${agent}-pick-${g}`, { label: g, size: "sm", variant: "outline", tooltip: `Use litellm/${g} here (a fallback chain keeps the models before it)`, onClick: (_e, cx) => { const parts = field.value().split(">").map((x) => x.trim()); parts[parts.length - 1] = `litellm/${g}`; field.set_value(parts.filter(Boolean).join(" > ")); this.focusField = null; cx.notify(); } })))));
               }
               return h_flex().id(`omo-${key}-m-${agent}`).gap(10).child(label).child(div().flex_1().min_w(0).truncate().text_size(TEXT.sm).font_family("JetBrains Mono").text_color(k.foreground).child(model));
             }),
@@ -210,7 +249,7 @@ export default class Machines {
             sys.length || omos.length
               ? v_flex()
                   .gap(16)
-                  .child(div().w_full().flex().flex_row().flex_wrap().gap(16).children(sys.map(([m, s]) => div().min_w(340).flex_1().child(this.machineCard(k, m, s)))))
+                  .child(div().w_full().flex().flex_row().flex_wrap().gap(16).children([div().min_w(340).flex_1().child(this.gatewayCard(k)), ...sys.map(([m, s]) => div().min_w(340).flex_1().child(this.machineCard(k, m, s)))]))
                   .child(div().w_full().flex().flex_row().flex_wrap().gap(16).children(omos.map(([m, v]) => div().min_w(340).flex_1().child(this.omoCard(k, m, v)))))
               : Empty({ icon: "layers", title: "Asking the machines…", description: "Each machine answers within a few seconds." }),
           ),

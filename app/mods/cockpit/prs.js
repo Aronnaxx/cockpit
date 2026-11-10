@@ -11,6 +11,7 @@ import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mo
 import { loadPrs, prs, prsConfig, ago } from "./prsdata.js";
 import { urgent, urgency } from "./prcards.js";
 import { Drafts } from "./prreview.js";
+import { PrFiles } from "./prfiles.js";
 import { installedEditors, openInEditor } from "./editors.js";
 import { CodeBlock, makeCode } from "./codeblock.js";
 import { openInSpace, prWorktree, LAUNCH_AGENTS, launchAgent, lastAgent, prPrompt, repoFolder } from "./agentlaunch.js";
@@ -63,6 +64,8 @@ export default class Prs {
     this.merge = new Map();
     this.rebaseAsk = null;
     this.drafts = new Drafts();
+    this.pfiles = new PrFiles();
+    this.view = null;
     this.omo = new OmoModel();
     this.omo.follow(cx);
     const pull = (cx, force) =>
@@ -108,6 +111,7 @@ export default class Prs {
 
   select(cx, p) {
     this.sel = keyOf(p);
+    this.view = null;
     this.task = null;
     if (!this.convo.has(keyOf(p))) this.readConvo(cx, p);
     this.drafts.load(cx, p).then((c) => c && cx.notify());
@@ -455,6 +459,7 @@ export default class Prs {
               .gap(6)
               .pt(4)
               .child(Button("prs-open", { label: "Open PR", icon: "external", size: "sm", variant: "outline", onClick: (_e, cx) => cx.spawn(async () => hub.openUrl(p.url)) }))
+              .child(Button("prs-files", { label: `Files changed${this.pfiles.files(p) ? ` · ${this.pfiles.files(p).length}` : ""}`, icon: "git-commit", size: "sm", variant: "outline", tooltip: "Every changed file as a diff or in full; click a line to comment on it", onClick: (_e, cx) => { this.view = "files"; this.pfiles.load(cx, p); this.drafts.load(cx, p).then((c) => c && cx.notify()); cx.notify(); } }))
               .when(this.editors.length > 0, (e) => e.child(Button("prs-openin", { label: "Open in…", icon: "folder", size: "sm", variant: "outline", tooltip: "The pull request's worktree, in an editor", onClick: () => openMenu(this.editors.map(([id, , label]) => ({ label, icon: "code", command: `prs:openin:${id}:${keyOf(p)}` })), { width: 200 }) })))
               .child(Button("prs-worktree", { label: this.worktrees.has(keyOf(p)) ? "Open worktree" : "Explore in a worktree", icon: "git-branch", size: "sm", variant: "outline", tooltip: "A git worktree of this pull request's head in ~/worktrees, opened in a new tab; your own checkout is not touched", onClick: (_e, cx) => this.worktree(cx, p) }))
               .when(this.worktrees.has(keyOf(p)), (e) => e.child(Button("prs-worktree-rm", { label: "Remove worktree", size: "sm", variant: "ghost", onClick: (_e, cx) => this.worktree(cx, p, true) })))
@@ -651,8 +656,8 @@ export default class Prs {
                   .px(24)
                   .py(16)
                   .gap(12)
-                  .child(h_flex().child(Button("prs-back", { label: "Pull requests", icon: "chevron-left", variant: "ghost", size: "sm", onClick: (_e, cx) => ((this.sel = null), setShared("cockpit.prs.focus", null), cx.notify()) })))
-                  .child(this.detail(k, sel, cx))
+                  .child(h_flex().gap(8).items_center().child(Button("prs-back", { label: this.view === "files" ? sel.title : "Pull requests", icon: "chevron-left", variant: "ghost", size: "sm", onClick: (_e, cx) => (this.view === "files" ? (this.view = null) : ((this.sel = null), setShared("cockpit.prs.focus", null)), cx.notify()) })).when(this.view === "files", (e) => e.child(div().text_size(TEXT.sm).font_semibold().child("Files changed"))))
+                  .child(this.view === "files" ? this.pfiles.render(k, sel, this.drafts, this.cfg) : this.detail(k, sel, cx))
               : listView,
       )
       .when(Boolean(this.drafts.confirm), (e) => {
@@ -662,11 +667,11 @@ export default class Prs {
         const verb = de?.verdict === "APPROVE" ? "an approval" : de?.verdict === "REQUEST_CHANGES" ? "a request for changes" : "a review";
         return e.child(
           AlertDialog("prs-post", {
-            title: `Post ${verb} on ${dp.repo.split("/")[1]}#${dp.number}?`,
-            description: `${n.lines} line comment${n.lines === 1 ? "" : "s"} and ${n.replies} repl${n.replies === 1 ? "y" : "ies"} go to GitHub under your name, visible to everyone on the pull request.`,
-            confirmLabel: "Post review",
+            title: this.drafts.confirm.pending ? `Keep the draft on GitHub as pending on ${dp.repo.split("/")[1]}#${dp.number}?` : `Post ${verb} on ${dp.repo.split("/")[1]}#${dp.number}?`,
+            description: this.drafts.confirm.pending ? `${n.lines} line comment${n.lines === 1 ? "" : "s"} are saved on GitHub as a pending review. Only you see it, in VS Code's pull request view and on the PR page, until you submit it. Nothing is published.` : `${n.lines} line comment${n.lines === 1 ? "" : "s"} and ${n.replies} repl${n.replies === 1 ? "y" : "ies"} go to GitHub under your name, visible to everyone on the pull request.`,
+            confirmLabel: this.drafts.confirm.pending ? "Keep as pending" : "Post review",
             onCancel: (_e, cx) => ((this.drafts.confirm = null), cx.notify()),
-            onConfirm: (_e, cx) => this.drafts.post(cx, dp, (cx) => this.readConvo(cx, dp)),
+            onConfirm: (_e, cx) => this.drafts.post(cx, dp, (cx) => this.readConvo(cx, dp), Boolean(this.drafts.confirm.pending)),
           }),
         );
       })

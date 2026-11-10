@@ -189,6 +189,14 @@ export class Drafts {
     cx.notify();
   }
 
+  removeRow(cx, p, r) {
+    const e = this.m.get(keyOf(p));
+    if (!e) return;
+    e.rows = e.rows.filter((x) => x !== r);
+    this.queueSave(cx, e);
+    cx.notify();
+  }
+
   async discard(cx, p) {
     const { home } = await hub.install();
     await exec("rm", ["-f", draftFile(home, p)]);
@@ -198,7 +206,7 @@ export class Drafts {
   }
 
   /** Sends it (after the confirmation). */
-  post(cx, p, done) {
+  post(cx, p, done, pending = false) {
     cx.spawn(async (cx) => {
       this.busy = keyOf(p);
       cx.notify();
@@ -206,9 +214,10 @@ export class Drafts {
         const e = this.m.get(keyOf(p));
         if (e?.exists) await this.save(e);
         const { home } = await hub.install();
-        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-pr-review.py`, p.repo, String(p.number), draftFile(home, p)], { timeout: 180000 });
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-pr-review.py`, p.repo, String(p.number), draftFile(home, p), ...(pending ? ["--pending"] : [])], { timeout: 180000 });
         const d = JSON.parse(r.stdout || "{}");
-        if (d.error) notify({ title: "Review not posted", body: d.error });
+        if (d.error) notify({ title: pending ? "Not kept on GitHub" : "Review not posted", body: d.error });
+        else if (d.pending !== undefined) notify({ title: "Kept as a pending review on GitHub", body: `${keyOf(p)}: ${d.pending} comment${d.pending === 1 ? "" : "s"}. Only you see it; open it in VS Code's pull request view and submit it there, or keep editing here.` });
         else {
           notify({ title: "Review posted", body: `${keyOf(p)}: ${d.posted} comment${d.posted === 1 ? "" : "s"}, ${d.replies} repl${d.replies === 1 ? "y" : "ies"}` });
           this.m.set(keyOf(p), { raw: null, exists: false });
@@ -249,6 +258,7 @@ export class Drafts {
       e.exists ? Button("rv-preview", { label: showPreview ? "Back to editing" : "Preview", icon: showPreview ? "pencil" : "eye", size: "sm", variant: "ghost", onClick: (_e, cx) => { showPreview ? this.preview.delete(keyOf(p)) : this.preview.add(keyOf(p)); cx.notify(); } }) : null,
       e.exists ? Button("rv-discard", { label: "Discard", size: "sm", variant: "ghost", onClick: (_e, cx) => this.discard(cx, p) }) : null,
       Button("rv-save", { label: "Save draft", size: "sm", variant: "outline", disabled: empty, onClick: (_e, cx) => { e.chain = e.chain.then(() => this.save(e)).catch(() => {}); notify({ title: "Draft saved", body: `${keyOf(p)} · it stays here until you post it` }); cx.notify(); } }),
+      e.exists && !empty ? Button("rv-pending", { label: "Keep on GitHub as pending…", size: "sm", variant: "ghost", tooltip: "Sends it as a pending review only you see; VS Code's pull request view lists it", onClick: (_e, cx) => ((this.confirm = { p, pending: true }), cx.notify()) }) : null,
       Button("rv-post", { label: this.busy === keyOf(p) ? "Posting…" : "Post review…", size: "sm", disabled: this.busy === keyOf(p) || empty, onClick: (_e, cx) => ((this.confirm = { p }), cx.notify()) }),
     ].filter(Boolean));
     if (showPreview) {

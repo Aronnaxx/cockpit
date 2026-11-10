@@ -8,7 +8,7 @@ import { h_flex, v_flex, InputState } from "gpui-base";
 import { run, spaces, knownAgents, setShared, layout, readTextFile, exec } from "herdr";
 import { show } from "./sidebar.js";
 import { loadPrs, prs, prs as prsData, prsConfig } from "./prsdata.js";
-import { PrSections, startFromHome, openTab } from "./prcards.js";
+import { PrSections, startFromHome, openTab, reviewOf, openDetails } from "./prcards.js";
 import { followUsage, AgentLimits } from "./usage.js";
 import { runRecap, recapLabel, SubagentsModel, PerfModel, OmoModel, machineOf, tpsText, localSessions, sessionFor } from "./agentsui.js";
 import { findNode } from "./status.js";
@@ -1198,6 +1198,8 @@ export default class Home {
     } else if (isAgentCard) {
       // Always drawn, so a card never changes size when it is pointed at or picked.
       actions.push(Button(`${card.key}-go`, { label: "Go to agent", variant: "outline", size: "sm", onClick: () => goToAgent(a) }));
+      const review = reviewOf(a.tab_name ?? a.title);
+      if (review) actions.push(Button(`${card.key}-review`, { label: /^(review|rereview)/.test(a.tab_name ?? a.title) ? "Go to review" : "Go to PR", icon: "git-pull-request", variant: "outline", size: "sm", onClick: () => openDetails(review, show) }));
       actions.push(Button(`${card.key}-recap`, { label: "Recap", icon: "sparkles", variant: "ghost", size: "sm", kbd: "r", tooltip: `Recap with ${recapLabel()}`, onClick: (_e, cx) => this.run("recap", card, cx) }));
       if (card.stage === "done") actions.push(Button(`${card.key}-archive`, { label: "Archive", icon: "archive", variant: "ghost", size: "sm", kbd: "a", onClick: (_e, cx) => this.archive(cx, a) }));
       if (card.stage === "working") actions.push(Button(`${card.key}-queue`, { label: "Queue a prompt", icon: "list-ordered", variant: "ghost", size: "sm", onClick: (_e, cx) => this.run("queue", card, cx) }));

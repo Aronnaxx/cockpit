@@ -5,8 +5,16 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { notify, setShared } from "herdr";
 import { tokens, alpha, TEXT, RADIUS, Button, Mono, StageHeading, openMenu } from "./ui.js";
-import { ago } from "./prsdata.js";
+import { ago, prs } from "./prsdata.js";
 import { LAUNCH_AGENTS, launchAgent, lastAgent, prPrompt, prWorktree } from "./agentlaunch.js";
+
+/** The pull request an agent's tab is about: tabs named "review mono#1937", "fix mono#1934", "conflicts mono#1934"... */
+export function reviewOf(label) {
+  const m = String(label ?? "").match(/^(?:review|rereview|fix|rebase|conflicts) ([^#\s]+)#(\d+)$/);
+  if (!m) return null;
+  const d = prs();
+  return [...(d?.mine ?? []), ...(d?.assigned ?? [])].find((p) => p.repo.split("/")[1] === m[1] && String(p.number) === m[2]) ?? null;
+}
 
 export const prKey = (p) => `${p.repo}#${p.number}`;
 

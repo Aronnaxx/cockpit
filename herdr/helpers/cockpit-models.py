@@ -14,7 +14,32 @@ import urllib.request
 CACHE = os.path.expanduser("~/.cache/cockpit/models.json")
 
 
+def status():
+    """{ok, ms, count, base_url, error?}: whether the gateway answers, how fast, and how many models it lists (never cached)."""
+    try:
+        ll = (json.load(open(os.path.expanduser("~/.config/cockpit/config.json"))).get("litellm") or {})
+    except Exception:
+        ll = {}
+    if not ll.get("base_url"):
+        return {"ok": False, "error": "set litellm.base_url in the cockpit config"}
+    key = os.environ.get("LITELLM_API_KEY", "")
+    kf = os.path.expanduser(ll.get("key_file") or "")
+    if not key and kf and os.path.exists(kf):
+        key = open(kf, encoding="utf-8").read().strip()
+    t = time.time()
+    try:
+        req = urllib.request.Request(ll["base_url"].rstrip("/") + "/v1/models", headers={"Authorization": f"Bearer {key}"} if key else {})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            n = len(json.load(r).get("data") or [])
+        return {"ok": True, "ms": int((time.time() - t) * 1000), "count": n, "base_url": ll["base_url"]}
+    except Exception as e:
+        return {"ok": False, "ms": int((time.time() - t) * 1000), "base_url": ll["base_url"], "error": str(e)[:160]}
+
+
 def main():
+    if sys.argv[1:2] == ["--status"]:
+        print(json.dumps(status()))
+        return 0
     try:
         old = json.load(open(CACHE))
         if time.time() - old.get("at", 0) < 600 and old.get("models"):

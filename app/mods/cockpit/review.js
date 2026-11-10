@@ -7,6 +7,7 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState } from "gpui-base";
 import { focused, panes, agents, layout, props, shared, setShared } from "herdr";
 import * as hub from "./hub.js";
+import { ModelPicker } from "./modelpick.js";
 import { openCode } from "./code.js";
 import { tokens, alpha, TEXT, RADIUS, Icon, Badge, Button, Kbd, Tabs, Empty, Toaster, Spinner, Overline } from "./ui.js";
 import { DiffView } from "./diff.js";
@@ -16,7 +17,6 @@ const SCOPES = [
   { value: "branch", label: "Branch" },
   { value: "pr", label: "PR" },
 ];
-const MODELS = [["haiku", "Haiku", "fast and cheap"], ["sonnet", "Sonnet", "better on large changes"], ["opus", "Opus", "the most careful"]];
 const NOTE = { choice: ["Decision", "flag"], upkeep: ["Upkeep", "wrench"], gap: ["Limitation", "triangle-alert"], divergence: ["Divergence", "git-fork"], untested: ["Untested", "circle-help"] };
 
 function shown() {
@@ -63,7 +63,8 @@ export default class Review {
       cx.notify();
     });
     this.diff = this.withOpen(new DiffView("review", this.input));
-    this.walkModel = "haiku";
+    // The model that writes the walkthrough: any model of the LiteLLM gateway, searched and picked; none is preset.
+    this.picker = new ModelPicker(cx, { placeholder: "Search the gateway's models", store: "cockpit.walkthrough.model" });
     cx.timer.every(1000, (cx) => this.tick(cx));
   }
 
@@ -202,7 +203,7 @@ export default class Review {
 
   generate(cx) {
     cx.spawn(async (cx) => {
-      const r = await hub.act("review", "walkthrough", [this.repo, this.scope, this.walkModel]).catch((e) => ({ error: String(e?.message ?? e) }));
+      const r = await hub.act("review", "walkthrough", [this.repo, this.scope, this.picker.value()]).catch((e) => ({ error: String(e?.message ?? e) }));
       if (r.error) this.toasts.push(cx, r.error, { kind: "error" });
       else this.toasts.push(cx, r.note || "Writing the walkthrough", { kind: "info" });
       this.next = 0;
@@ -417,20 +418,14 @@ export default class Review {
   }
 
   generateCard(k, w, narrow) {
-    const pills = h_flex().gap(6).flex_wrap().children(MODELS.map(([value, label, about]) => {
-      const on = value === this.walkModel;
-      return h_flex().id(`review-model-${value}`).h(28).px(10).gap(6).items_center().rounded(RADIUS.md).cursor_pointer().text_size(TEXT.sm)
-        .border_1().border_color(on ? k.ring : k.border).bg(on ? alpha(k.ring, 0.08) : k.card).hover((s) => s.bg(k.accent))
-        .tooltip(about).on_click((_e, cx) => { this.walkModel = value; cx.notify(); })
-        .child(div().font_medium().child(label)).when(!narrow, (e) => e.child(div().text_size(TEXT.xs).text_color(k.mutedFg).child(about)));
-    }));
+    const pills = this.picker.element(k, "walk");
     return v_flex().flex_1().items_center().justify_center().p(24).child(
       v_flex().max_w(460).gap(14).p(20).rounded(RADIUS.lg).border_1().border_color(k.border).bg(k.card)
         .child(h_flex().gap(8).items_center().child(Icon("route", { size: 18, color: k.ring })).child(div().text_size(TEXT.lg).font_semibold().child("Walk through these changes")))
         .child(div().text_size(TEXT.sm).text_color(k.mutedFg).child("An agent groups the hunks into steps in the order they make sense, explains what each changes, and lists what no step covers. It explains, it does not judge. One background call, no tools, cached by the exact changes."))
         .when(w.status === "failed", (e) => e.child(h_flex().gap(8).p(10).rounded(RADIUS.md).bg(alpha(k.destructive, 0.1)).text_size(TEXT.sm).child(Icon("alert", { size: 14, color: k.destructive })).child(div().flex_1().child(w.error ?? "it failed"))))
         .child(pills)
-        .child(h_flex().justify_end().child(Button("review-generate", { label: w.status === "failed" ? "Try again" : "Generate", icon: "sparkles", onClick: (_e, cx) => this.generate(cx) }))),
+        .child(h_flex().justify_end().child(Button("review-generate", { label: w.status === "failed" ? "Try again" : "Generate", icon: "sparkles", disabled: !this.picker.value(), tooltip: this.picker.value() ? undefined : "Pick a model first", onClick: (_e, cx) => this.generate(cx) }))),
     );
   }
 }

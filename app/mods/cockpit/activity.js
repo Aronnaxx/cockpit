@@ -17,6 +17,7 @@ const ITEMS = [
   { name: "changes", icon: "git-commit", label: "Changes", key: "⌃⌘5" },
   { name: "context", icon: "gauge", label: "Context", key: "⌃⌘6" },
   { name: "subagents", icon: "git-fork", label: "Subagents", key: "⌃⌘7" },
+  { name: "comments", icon: "message-circle", label: "Comments", key: "⌃⌘8" },
 ];
 
 export default class Activity {
