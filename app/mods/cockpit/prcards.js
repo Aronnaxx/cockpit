@@ -6,7 +6,7 @@ import { h_flex, v_flex } from "gpui-base";
 import { notify, setShared } from "herdr";
 import { tokens, alpha, TEXT, RADIUS, Button, Mono, StageHeading, openMenu } from "./ui.js";
 import { ago } from "./prsdata.js";
-import { LAUNCH_AGENTS, launchAgent, lastAgent, prPrompt, repoFolder } from "./agentlaunch.js";
+import { LAUNCH_AGENTS, launchAgent, lastAgent, prPrompt, prWorktree } from "./agentlaunch.js";
 
 export const prKey = (p) => `${p.repo}#${p.number}`;
 
@@ -44,7 +44,7 @@ export function startFromHome(rest, list, cfg, cx) {
   const p = list.find((x) => prKey(x) === key.join(":"));
   if (!p) return;
   cx.spawn(async (cx) => {
-    const ok = await launchAgent({ agent, prompt: prPrompt(kind, p), folder: repoFolder(p.repo, cfg), name: `${kind} ${p.repo.split("/")[1]}#${p.number}` });
+    const ok = await launchAgent({ agent, prompt: prPrompt(kind, p), folder: await prWorktree(p, cfg), name: `${kind} ${p.repo.split("/")[1]}#${p.number}` });
     if (ok) notify({ title: "Agent started", body: `${LAUNCH_AGENTS.find((a) => a.id === agent)?.label ?? agent} is on ${prKey(p)}.` });
     cx.notify();
   });

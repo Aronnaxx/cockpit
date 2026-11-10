@@ -11,8 +11,9 @@ import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mo
 import { loadPrs, prs, prsConfig, ago } from "./prsdata.js";
 import { urgent, urgency } from "./prcards.js";
 import { Drafts } from "./prreview.js";
+import { installedEditors, openInEditor } from "./editors.js";
 import { CodeBlock, makeCode } from "./codeblock.js";
-import { LAUNCH_AGENTS, launchAgent, lastAgent, prPrompt, repoFolder } from "./agentlaunch.js";
+import { openInSpace, prWorktree, LAUNCH_AGENTS, launchAgent, lastAgent, prPrompt, repoFolder } from "./agentlaunch.js";
 import { OmoModel } from "./agentsui.js";
 
 const keyOf = (p) => `${p.repo}#${p.number}`;
@@ -20,9 +21,6 @@ const TASKS = {
   author: [["fix", "Address comments and CI"], ["rebase", "Rebase onto main"]],
   reviewer: [["review", "Review it"], ["rereview", "Re-review (only what changed)"]],
 };
-
-// id, app name (macOS), label: what "Open in…" offers when it is installed.
-const EDITORS = [["vscode", "Visual Studio Code", "VS Code"], ["zed", "Zed", "Zed"], ["antigravity", "Antigravity", "Antigravity"], ["antigravity-ide", "Antigravity IDE", "Antigravity IDE"], ["cursor", "Cursor", "Cursor"], ["windsurf", "Windsurf", "Windsurf"]];
 
 export default class Prs {
   init(_p, cx) {
@@ -33,14 +31,7 @@ export default class Prs {
     this.q.on("change", (_e, cx) => cx.notify());
     // The editors installed here, for "Open in…".
     this.editors = [];
-    cx.spawn(async (cx) => {
-      try {
-        const r = await exec("sh", ["-c", "ls /Applications ~/Applications 2>/dev/null"], { timeout: 10000 });
-        const have = new Set(String(r.stdout).split("\n").map((n) => n.replace(/\.app$/, "")));
-        this.editors = EDITORS.filter(([, app]) => have.has(app));
-      } catch {}
-      cx.notify();
-    });
+    installedEditors().then((e) => ((this.editors = e), cx.notify()));
     this.repoF = null;
     this.authorF = null;
     this.reviewF = "all";
@@ -176,7 +167,7 @@ export default class Prs {
       try {
         const { home } = await hub.install();
         const folder = repoFolder(p.repo, this.cfg).replace(/^~/, home);
-        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-worktree.py`, p.repo, String(p.number), folder, ...(remove ? ["--remove"] : [])], { timeout: 400000 });
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-worktree.py`, p.repo, String(p.number), folder, ...(remove ? ["--remove"] : p.cross ? [] : ["--branch", p.branch])], { timeout: 400000 });
         const d = JSON.parse(r.stdout || "{}");
         if (d.error) return notify({ title: "No worktree", body: d.error });
         if (remove) {
@@ -184,8 +175,7 @@ export default class Prs {
           notify({ title: "Worktree removed", body: d.removed });
         } else {
           this.worktrees.add(keyOf(p));
-          run("tab.new", { name: `${p.repo.split("/")[1]}#${p.number}`, folder: d.path });
-          run("layout.select", { stack: "center", child: "work" });
+          openInSpace(p.repo.split("/")[1], { name: `${p.repo.split("/")[1]}#${p.number}`, folder: d.path });
           notify({ title: d.reused ? "Worktree updated" : "Worktree ready", body: d.path });
         }
       } catch (e) {
@@ -197,18 +187,15 @@ export default class Prs {
 
   /** The pull request's worktree (made or brought up to date), opened in an editor. */
   openIn(cx, p, id) {
-    const app = EDITORS.find(([e]) => e === id)?.[1];
-    if (!app) return;
     cx.spawn(async (cx) => {
       try {
         const { home } = await hub.install();
         const folder = repoFolder(p.repo, this.cfg).replace(/^~/, home);
-        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-worktree.py`, p.repo, String(p.number), folder], { timeout: 400000 });
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-worktree.py`, p.repo, String(p.number), folder, ...(p.cross ? [] : ["--branch", p.branch])], { timeout: 400000 });
         const d = JSON.parse(r.stdout || "{}");
         if (d.error) return notify({ title: "No worktree", body: d.error });
         this.worktrees.add(keyOf(p));
-        await exec("open", ["-a", app, d.path], { timeout: 20000 });
-        notify({ title: `Opened in ${app}`, body: d.path });
+        await openInEditor(id, d.path);
       } catch (e) {
         notify({ title: "Could not open it", body: String(e?.message ?? e).slice(0, 160) });
       }
@@ -277,7 +264,7 @@ export default class Prs {
   /** Starts the picked agent (or `agent`) on a pull request with the task's prompt. */
   start(cx, p, kind, agent = this.agent) {
     cx.spawn(async (cx) => {
-      const ok = await launchAgent({ agent, prompt: prPrompt(kind, { ...p, ci: { failed: this.failedJobs(p) }, conflicts: this.merge.get(keyOf(p))?.files }), folder: repoFolder(p.repo, this.cfg), name: `${kind} ${p.repo.split("/")[1]}#${p.number}`, model: this.modelValue() });
+      const ok = await launchAgent({ agent, prompt: prPrompt(kind, { ...p, ci: { failed: this.failedJobs(p) }, conflicts: this.merge.get(keyOf(p))?.files }), folder: await prWorktree(p, this.cfg), name: `${kind} ${p.repo.split("/")[1]}#${p.number}`, model: this.modelValue() });
       if (ok) notify({ title: "Agent started", body: `${LAUNCH_AGENTS.find((a) => a.id === agent)?.label ?? agent} is on ${keyOf(p)}.` });
       cx.notify();
     });

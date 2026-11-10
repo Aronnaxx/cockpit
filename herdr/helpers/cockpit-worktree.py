@@ -17,6 +17,16 @@ def git(repo, *args):
     return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=300)
 
 
+def tie(repo, slug, number, branch, want):
+    """Makes the local branch the pull request's: it tracks origin's branch of that name, and carries the key the GitHub Pull
+    Requests extension of VS Code reads to know which PR it is."""
+    git(repo, "config", f"branch.{branch}.cockpit-made", "true")
+    git(repo, "config", f"branch.{branch}.github-pr-owner-number", "#".join([slug.split("/")[0], slug.split("/")[1], str(number)]))
+    if want and branch == want:
+        git(repo, "config", f"branch.{branch}.remote", "origin")
+        git(repo, "config", f"branch.{branch}.merge", f"refs/heads/{want}")
+
+
 def listing(roots):
     """Every git worktree of the repositories at `roots` (plus any under ~/worktrees): {path, name, branch, head, dirty, main, repo, pr, at}."""
     import re
@@ -66,7 +76,7 @@ def main():
         repo = os.path.dirname(common)
         branch = git(path, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         r = git(repo, "worktree", "remove", "--force", path)
-        if branch.startswith("cockpit-pr-"):
+        if branch.startswith("cockpit-pr-") or git(repo, "config", f"branch.{branch}.cockpit-made").stdout.strip() == "true":
             git(repo, "branch", "-D", branch)
         print(json.dumps({"removed": path} if r.returncode == 0 else {"error": (r.stderr.strip().splitlines() or ["failed"])[-1][:200]}))
         return 0
@@ -75,14 +85,25 @@ def main():
         return 2
     slug, number, repo = sys.argv[1], sys.argv[2], os.path.expanduser(sys.argv[3])
     name = slug.split("/")[1]
-    branch = f"cockpit-pr-{number}"
     path = os.path.expanduser(f"~/worktrees/{name}-pr{number}")
+    # The pull request's own branch name, so editors and the GitHub PR extension see it as that PR's branch; a
+    # `cockpit-pr-<n>` name when that branch is checked out elsewhere (it is your own checkout's, say) or the PR is from a fork.
+    want = sys.argv[sys.argv.index("--branch") + 1] if "--branch" in sys.argv else None
+    branch = f"cockpit-pr-{number}"
+    if want and os.path.isdir(repo):
+        in_use = [l for l in git(repo, "worktree", "list", "--porcelain").stdout.splitlines() if l == f"branch refs/heads/{want}"]
+        existing = os.path.isdir(path) and git(path, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == want
+        if existing or not in_use:
+            branch = want
     if not os.path.isdir(os.path.join(repo, ".git")) and not os.path.isfile(os.path.join(repo, ".git")):
         print(json.dumps({"error": f"{repo} is not a git checkout"}))
         return 0
     if "--remove" in sys.argv:
+        if os.path.isdir(path):
+            branch = git(path, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or branch
         git(repo, "worktree", "remove", "--force", path)
-        git(repo, "branch", "-D", branch)
+        if branch.startswith("cockpit-pr-") or git(repo, "config", f"branch.{branch}.cockpit-made").stdout.strip() == "true":
+            git(repo, "branch", "-D", branch)
         print(json.dumps({"removed": path}))
         return 0
     if os.path.isdir(path):
@@ -90,7 +111,8 @@ def main():
         f = git(repo, "fetch", "origin", f"+pull/{number}/head:{branch}")
         if f.returncode == 0:
             git(path, "reset", "--hard", branch)
-        print(json.dumps({"path": path, "reused": True}))
+        tie(repo, slug, number, branch, want)
+        print(json.dumps({"path": path, "reused": True, "branch": branch}))
         return 0
     f = git(repo, "fetch", "origin", f"+pull/{number}/head:{branch}")
     if f.returncode != 0:
@@ -101,7 +123,8 @@ def main():
     if w.returncode != 0:
         print(json.dumps({"error": (w.stderr.strip().splitlines() or ["git worktree add failed"])[-1][:200]}))
         return 0
-    print(json.dumps({"path": path}))
+    tie(repo, slug, number, branch, want)
+    print(json.dumps({"path": path, "branch": branch}))
     return 0
 
 

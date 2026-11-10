@@ -6,8 +6,10 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { exec, notify, panes, run } from "herdr";
 import * as hub from "./hub.js";
-import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mono, Spinner, AlertDialog, Chip } from "./ui.js";
+import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mono, Spinner, AlertDialog, Chip, openMenu } from "./ui.js";
 import { prs, prsConfig, ago } from "./prsdata.js";
+import { installedEditors, openInEditor } from "./editors.js";
+import { openInSpace } from "./agentlaunch.js";
 
 export default class Worktrees {
   init(_p, cx) {
@@ -15,12 +17,17 @@ export default class Worktrees {
     this.busy = null;
     this.confirm = null;
     this.repo = null;
+    this.editors = [];
+    installedEditors().then((e) => ((this.editors = e), cx.notify()));
     this.load(cx);
     cx.timer.every(15000, (cx) => this.load(cx));
   }
 
   command(c, cx) {
     if (c === "show:worktrees" || c === "focus") this.load(cx);
+    // From the "Open in…" menu: worktrees:openin:<editor>:<path>
+    const m = c.match(/^worktrees:openin:([a-z-]+):(.+)$/);
+    if (m) openInEditor(m[1], m[2]);
   }
 
   /** Reads again: the repositories are the folders agents and tabs are in, the configured ones, and the pull requests' repositories. */
@@ -81,7 +88,8 @@ export default class Worktrees {
       )
       .when(here.length > 0, (e) => e.child(Badge(here.length === 1 ? `${here[0].program?.name ?? "agent"} working here` : `${here.length} agents here`, "warning")))
       .child(t.dirty ? Badge(`${t.dirty} changed`, "warning") : Badge("clean", "success"))
-      .child(Button(`wt-open-${t.path}`, { label: "Open in a tab", icon: "folder", size: "sm", variant: "outline", onClick: () => { run("tab.new", { name: t.name, folder: t.path }); run("layout.select", { stack: "center", child: "work" }); } }))
+      .when(this.editors.length > 0, (e) => e.child(Button(`wt-in-${t.path}`, { label: "Open in…", icon: "code", size: "sm", variant: "outline", onClick: () => openMenu(this.editors.map(([id, , label]) => ({ label, icon: "code", command: `worktrees:openin:${id}:${t.path}` })), { width: 200 }) })))
+      .child(Button(`wt-open-${t.path}`, { label: "Open in a tab", icon: "folder", size: "sm", variant: "outline", onClick: () => openInSpace(t.repo_name, { name: t.name, folder: t.path }) }))
       .when(!t.main, (e) => e.child(Button(`wt-rm-${t.path}`, { label: this.busy === t.path ? "Removing…" : "Remove", size: "sm", variant: "ghost", disabled: this.busy === t.path || here.length > 0, tooltip: here.length ? "An agent is working here" : undefined, onClick: (_e, cx) => ((this.confirm = t), cx.notify()) })));
   }
 

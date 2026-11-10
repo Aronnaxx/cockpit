@@ -1,7 +1,7 @@
 // Starts an agent in a new tab with a first message: the agent is picked (Codex, Antigravity, OpenCode, Claude Code), and
 // cockpit builds its own command line for it (`cockpit agent argv start`), with a model when one is chosen.
 
-import { exec, run, notify } from "herdr";
+import { exec, run, notify, spaces } from "herdr";
 import * as hub from "./hub.js";
 
 /** The agents a person can pick for a pull request's work. */
@@ -21,8 +21,31 @@ export function lastAgent() {
   }
 }
 
+/** The pull request's worktree on its own branch (made, or brought to its latest head): where an agent on the PR works, so Herdr's
+ *  own PR and Changes views see the branch. The repository's checkout when it cannot be made. */
+export async function prWorktree(p, cfg) {
+  const { home } = await hub.install();
+  const folder = repoFolder(p.repo, cfg).replace(/^~/, home);
+  try {
+    const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-worktree.py`, p.repo, String(p.number), folder, "--branch", p.branch], { timeout: 400000 });
+    const d = JSON.parse(r.stdout || "{}");
+    if (d.path) return d.path;
+  } catch {}
+  return folder;
+}
+
+/** A new tab in the space named after the repository (made when there is none), so a repository's agents and worktrees sit together. */
+export function openInSpace(spaceName, { name, folder, argv, task }) {
+  const here = spaces().find((s) => s.name === spaceName && !s.machine);
+  if (here) {
+    run("space.select", { id: here.id });
+    run("tab.new", { name, space: here.id, folder, ...(argv ? { argv } : {}), ...(task ? { task } : {}) });
+  } else run("space.new", { name: spaceName, folder, tab: name, ...(argv ? { argv } : {}), ...(task ? { task } : {}) });
+  run("layout.select", { stack: "center", child: "work" });
+}
+
 /** Starts `agent` in a new tab named `name`, in `folder`, with `prompt` as its first message. */
-export async function launchAgent({ agent, prompt, folder, name, model = null }) {
+export async function launchAgent({ agent, prompt, folder, name, model = null, repoName = null }) {
   try {
     localStorage.setItem("cockpit.launch.agent", agent);
   } catch {}
@@ -34,8 +57,7 @@ export async function launchAgent({ agent, prompt, folder, name, model = null })
     notify({ title: "Could not start the agent", body: String(r.stderr ?? "").trim().slice(0, 160) || `${agent} has no way to start with a prompt` });
     return false;
   }
-  run("tab.new", { name, folder: folder?.replace(/^~/, home), argv: ["sh", "-lc", line] });
-  run("layout.select", { stack: "center", child: "work" });
+  openInSpace(repoName ?? name.split(" ").pop().split("#")[0], { name, folder: folder?.replace(/^~/, home), argv: ["sh", "-lc", line] });
   return true;
 }
 
