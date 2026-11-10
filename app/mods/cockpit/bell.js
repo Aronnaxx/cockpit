@@ -1,9 +1,11 @@
 // The bell at the top right of the cockpit layout: how many agents wait for you, breathing while any does. A click
 // goes to the one that has waited longest; resting the pointer lists them with their questions; a right-click picks one.
 
-import { div } from "gpui-kit";
+import { div, svg } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
+import { run, layout, shared, setShared, openOverlay } from "herdr";
 import * as hub from "./hub.js";
+import { findNode } from "./status.js";
 import { fleet, goToAgent } from "./fleet.js";
 import { tokens, TEXT, RADIUS, alpha, Icon, HoverCard, Mono, CornerCount, dur, openMenu } from "./ui.js";
 
@@ -84,6 +86,28 @@ export default class Bell {
         ),
       )
       .child(h_flex().gap(6).text_size(TEXT.xs).text_color(k.dim).child("click: the longest waiting · ⌘J: next"));
-    return h_flex().id("bell").size_full().items_center().justify_center().pr(8).child(HoverCard("bell-card", button, card, { width: 300, openDelay: 300 }));
+    // The corner: the side panel's toggle and the cockpit settings sit with the bell, in one block of the tab bar's colour.
+    const panel = findNode(layout(), "panel");
+    const plain = (id, icon, tip, action, on = false) =>
+      h_flex().id(id).size(30).items_center().justify_center().rounded(RADIUS.md).cursor_pointer().tooltip(tip).text_color(on ? k.foreground : k.mutedFg).when(on, (e) => e.bg(k.selected))
+        .hover((s) => s.bg(k.accent).text_color(k.foreground)).on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click(action).child(icon);
+    const togglePanel_ = () => {
+      if (panel && !panel.hidden) return run("layout.hide", { id: "panel" });
+      run("layout.show", { id: "panel" });
+      if ((shared("cockpit.app") ?? "home") !== "work") { run("layout.select", { stack: "center", child: "work" }); setShared("cockpit.app", "work"); }
+    };
+    return h_flex()
+      .id("bell")
+      .size_full()
+      .gap(2)
+      .items_center()
+      .justify_center()
+      .px(6)
+      .bg(k.chrome)
+      .border_b_1()
+      .border_color(k.border)
+      .child(plain("corner-panel", Icon("panel-right", { size: 16 }), "Side panel: context, sub-agents, files, changes", togglePanel_, Boolean(panel && !panel.hidden)))
+      .child(plain("corner-settings", svg("mods/workspace-chrome/settings.svg").size(16), "Cockpit settings  ⌘⌥,", () => openOverlay({ mod: "cockpit", props: { app: "settings" }, kind: "dialog", width: 0.42, height: 0.78 })))
+      .child(HoverCard("bell-card", button, card, { width: 300, openDelay: 300 }));
   }
 }

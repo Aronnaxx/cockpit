@@ -37,7 +37,7 @@
           "resizable": false,
           "children": [
             { "id": "tabs", "type": "block", "window_drag": true, "content": { "mod": "tabs" } },
-            { "id": "bell", "type": "block", "size": { "px": 52 }, "window_drag": true, "content": { "mod": "cockpit", "props": { "app": "bell" } } }
+            { "id": "bell", "type": "block", "size": { "px": 118 }, "window_drag": true, "content": { "mod": "cockpit", "props": { "app": "bell" } } }
           ]
         },
         {
