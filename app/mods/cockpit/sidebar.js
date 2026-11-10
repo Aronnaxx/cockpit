@@ -143,16 +143,23 @@ export default class Sidebar {
         setShared("badge.subagents", badge);
       }
     });
-    cx.spawn(async (cx) => {
-      try {
-        this.install = await hub.install();
-        const { cache, home } = this.install;
-        const text = (await readTextFile(`${cache}/config.json`)) ?? (await readTextFile(`${home}/.config/cockpit/config.json`));
-        const pinned = text ? JSON.parse(text).spaces : null;
-        if (Array.isArray(pinned)) this.spaces = pinned.map((s) => (typeof s === "string" ? s : s.name));
-      } catch {}
-      cx.notify();
-    });
+    // The tabs in the config; read again every few seconds, so a change in Settings shows live.
+    const readSpaces = (cx) =>
+      cx.spawn(async (cx) => {
+        try {
+          this.install = await hub.install();
+          const { cache, home } = this.install;
+          const text = (await readTextFile(`${cache}/config.json`)) ?? (await readTextFile(`${home}/.config/cockpit/config.json`));
+          const pinned = text ? JSON.parse(text).spaces : null;
+          if (Array.isArray(pinned)) {
+            const next = pinned.map((s) => (typeof s === "string" ? s : s.name));
+            if (next.join() !== this.spaces.join()) this.spaces = next;
+          }
+        } catch {}
+        cx.notify();
+      });
+    readSpaces(cx);
+    cx.timer.every(3000, (cx) => readSpaces(cx));
     // The hub writes update.json every six hours; a window left open picks a newer cockpit up on its own.
     cx.spawn(async (cx) => {
       for (;;) {
