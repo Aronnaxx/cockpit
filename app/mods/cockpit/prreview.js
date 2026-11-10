@@ -37,6 +37,7 @@ export class Drafts {
     this.modelOf = () => "";
     // Whether posting may go ahead ({ok, why}: a passed quiz when quiz.gate is on), and the way to the quiz; set by the page.
     this.gateOf = () => ({ ok: true });
+    this.quizOf = null;
     this.toQuiz = null;
     // Kept in sync with your pending review on GitHub (bin/cockpit-pr-pending.py): key -> {on, busy, at, error, conflict, exists}.
     this.sync = new Map();
@@ -349,7 +350,28 @@ export class Drafts {
   syncRow(k, p, e) {
     const st = this.sync.get(keyOf(p)) ?? {};
     const on = Boolean(st.on);
-    const status = st.busy === "push" ? "Sending to GitHub…" : st.busy === "pull" ? "Taking GitHub's…" : st.busy === "status" && !st.at ? "Checking GitHub…" : st.error ? st.error : on ? (st.at ? `In sync · ${Math.max(0, Math.round((Date.now() - st.at) / 60000))}m ago${st.replies ? ` · ${st.replies} repl${st.replies === 1 ? "y stays" : "ies stay"} here (a reply cannot be pending)` : ""}` : "On") : st.exists ? "You have a pending review on GitHub that is not kept in sync" : "Only you see a pending review; VS Code's pull request view lists and edits it";
+    const gate = this.gateOf(p);
+    const q = this.quizOf?.(p) ?? null;
+    // The quiz, when the gate is on, comes before GitHub sees anything: the switch waits for it too.
+    const locked = !gate.ok && !on;
+    const ghStatus = st.busy === "push" ? "Sending…" : st.busy === "pull" ? "Taking GitHub's…" : st.error ? st.error : on ? (st.at ? `In sync · ${Math.max(0, Math.round((Date.now() - st.at) / 60000))}m ago${st.replies ? ` · replies stay here` : ""}` : "On") : locked ? "After the quiz" : st.exists ? "Off · you have one that is not synced" : "Off · only you would see it";
+    const block = (id, icon, title, status, tone, control) =>
+      h_flex().id(id).flex_1().min_w(0).gap(10).px(12).py(10).items_center().rounded(RADIUS.md).bg(k.card).border_1().border_color(k.border)
+        .child(Icon(icon, { size: 15, color: tone }))
+        .child(v_flex().flex_1().min_w(0).gap(1).child(div().text_size(TEXT.sm).text_color(k.foreground).child(title)).child(div().truncate().text_size(TEXT.xs).text_color(tone === k.warning || tone === k.destructive ? tone : k.dim).child(status)))
+        .child(control);
+    const pass = q?.total ? Math.round((q.right / q.total) * 100) : null;
+    const quizDone = q?.total && q.answered >= q.total;
+    const quizTone = !q?.total ? (gate.ok ? k.mutedFg : k.warning) : !quizDone ? k.info : gate.ok ? k.success : k.destructive;
+    const quizStatus = !q?.total ? (gate.ok ? "Not taken" : gate.why) : !quizDone ? `${q.answered} of ${q.total} answered` : `${q.right} of ${q.total} right (${pass}%)${gate.ok ? "" : ` · ${gate.why.split(": ").pop()}`}`;
+    const quiz = this.toQuiz
+      ? block(`rv-q-${keyOf(p)}`, quizDone && gate.ok ? "circle-check" : "circle-help", "Quiz", quizStatus, quizTone, Button(`rv-q-go-${keyOf(p)}`, { label: !q?.total ? "Take it" : quizDone ? "Open" : "Continue", size: "sm", variant: gate.ok ? "ghost" : "outline", onClick: (_e, cx) => this.toQuiz(p, cx) }))
+      : null;
+    const github = block(`rv-gh-${keyOf(p)}`, "git-pull-request", "Pending review on GitHub", ghStatus, st.error ? k.warning : on ? k.success : k.mutedFg,
+      h_flex().gap(6).items_center()
+        .when(Boolean(st.busy), (x) => x.child(Spinner({ size: 12 })))
+        .when(on && !st.busy, (x) => x.child(Button(`rv-sync-now-${keyOf(p)}`, { icon: "refresh-cw", size: "icon-sm", variant: "ghost", tooltip: "Check GitHub now", onClick: (_e, cx) => this.pending(cx, p, "status") })))
+        .child(Toggle(`rv-sync-${keyOf(p)}`, on, (cx) => (locked ? notify({ title: "Quiz first", body: gate.why }) : this.pending(cx, p, on ? "off" : "push")), { tooltip: locked ? gate.why : on ? "Stop keeping it in sync (what is on GitHub stays)" : "Keep the draft in sync as your pending review on GitHub: only you see it, VS Code's pull request view lists and edits it" })));
     const box = st.conflict
       ? v_flex().gap(8).p(10).rounded(RADIUS.md).border_1().border_color(alpha(k.warning, 0.6)).bg(alpha(k.warning, 0.08))
           .child(div().text_size(TEXT.sm).font_semibold().text_color(k.warning).child("Your pending review on GitHub was changed outside the cockpit"))
@@ -357,12 +379,9 @@ export class Drafts {
           .children(st.conflict.comments.slice(0, 4).map((c, i) => div().id(`rv-cf-${i}`).text_size(TEXT.xs).text_color(k.dim).truncate().child(`${String(c.path).split("/").pop()}:${c.start_line ? `${c.start_line}-` : ""}${c.line} · ${c.body}`)))
           .child(h_flex().gap(8).child(Button("rv-sync-pull", { label: "Use GitHub's", icon: "git-pull-request", size: "sm", variant: "outline", tooltip: "GitHub's summary and line comments replace the draft's (replies and reasons are kept)", onClick: (_e, cx) => this.pending(cx, p, "pull") })).child(Button("rv-sync-force", { label: "Use mine", size: "sm", variant: "ghost", tooltip: "The draft replaces the pending review on GitHub", onClick: (_e, cx) => this.pending(cx, p, "push", { force: true }) })))
       : null;
-    return v_flex().gap(8).pt(4).border_t_1().border_color(alpha(k.border, 0.6))
-      .child(h_flex().gap(10).items_center()
-        .child(Toggle(`rv-sync-${keyOf(p)}`, on, (cx) => this.pending(cx, p, on ? "off" : "push")))
-        .child(v_flex().flex_1().min_w(0).gap(1).child(div().text_size(TEXT.sm).text_color(k.foreground).child("Keep in sync as a pending review on GitHub")).child(div().text_size(TEXT.xs).text_color(st.error ? k.warning : k.dim).whitespace_normal().child(status)))
-        .when(Boolean(st.busy), (x) => x.child(Spinner({ size: 12 })))
-        .when(on && !st.busy, (x) => x.child(Button(`rv-sync-now-${keyOf(p)}`, { icon: "refresh-cw", size: "icon-sm", variant: "ghost", tooltip: "Check GitHub now", onClick: (_e, cx) => this.pending(cx, p, "status") }))))
+    return v_flex().gap(8).pt(8).border_t_1().border_color(alpha(k.border, 0.6))
+      .child(div().text_size(TEXT.xs).font_semibold().text_color(k.mutedFg).child("BEFORE YOU POST"))
+      .child(h_flex().gap(8).items_stretch().children([quiz, github].filter(Boolean)))
       .children([box].filter(Boolean));
   }
 
@@ -376,16 +395,23 @@ export class Drafts {
     const empty = !lines && !replies && !text && e.verdict === "COMMENT";
     const tone = e.verdict === "APPROVE" ? k.success : e.verdict === "REQUEST_CHANGES" ? k.destructive : k.mutedFg;
     const frame = (...kids) => v_flex().gap(10).p(14).rounded(RADIUS.lg).border_1().border_color(e.exists ? alpha(k.info, 0.5) : k.border).bg(e.exists ? alpha(k.info, 0.04) : k.card).children(kids.filter(Boolean));
-    const head = (extra = []) => h_flex().gap(8).items_center().child(div().text_size(TEXT.base).font_semibold().child("Your review")).when(e.exists, (x) => x.child(Badge("draft", "secondary"))).child(div().flex_1()).children(extra.filter(Boolean));
+    const saved = e.exists ? (Date.now() - (e.touched ?? 0) < 1500 ? "saving…" : "saved") : null;
+    const head = () =>
+      h_flex().gap(8).items_center()
+        .child(div().text_size(TEXT.base).font_semibold().child("Your review"))
+        .when(e.exists, (x) => x.child(Badge("draft", "secondary")).child(div().text_size(TEXT.xs).text_color(k.dim).child(saved)))
+        .child(div().flex_1())
+        .children([agentButton].filter(Boolean))
+        .when(e.exists, (x) => x.child(Button("rv-discard", { icon: "trash", size: "icon-sm", variant: "ghost", tooltip: "Discard the draft", onClick: (_e, cx) => this.discard(cx, p) })));
     const gate = this.gateOf(p);
     const setVerdict = (v, cx) => { e.verdict = v; this.begin(cx, e); cx.notify(); };
-    const actions = h_flex().gap(8).items_center().children([
-      e.exists ? Button("rv-preview", { label: showPreview ? "Back to editing" : "Preview", icon: showPreview ? "pencil" : "eye", size: "sm", variant: "ghost", onClick: (_e, cx) => { showPreview ? this.preview.delete(keyOf(p)) : this.preview.add(keyOf(p)); cx.notify(); } }) : null,
-      e.exists ? Button("rv-discard", { label: "Discard", size: "sm", variant: "ghost", onClick: (_e, cx) => this.discard(cx, p) }) : null,
-      Button("rv-save", { label: "Save draft", size: "sm", variant: "outline", disabled: empty, onClick: (_e, cx) => { e.chain = e.chain.then(() => this.save(e)).catch(() => {}); notify({ title: "Draft saved", body: `${keyOf(p)} · it stays here until you post it` }); cx.notify(); } }),
-      !gate.ok && this.toQuiz ? Button("rv-to-quiz", { label: "Take the quiz", icon: "circle-help", size: "sm", variant: "outline", tooltip: gate.why, onClick: (_e, cx) => this.toQuiz(p, cx) }) : null,
-      Button("rv-post", { label: this.busy === keyOf(p) ? "Posting…" : "Post review…", size: "sm", disabled: this.busy === keyOf(p) || empty || !gate.ok, tooltip: gate.ok ? undefined : gate.why, onClick: (_e, cx) => ((this.confirm = { p }), cx.notify()) }),
-    ].filter(Boolean));
+    // One toolbar: what you add and look at on the left, what you decide and send on the right.
+    const toolbar = h_flex().gap(8).items_center().pt(2)
+      .when(!showPreview, (x) => x.child(Button("rv-add", { label: "Line comment", icon: "plus", size: "sm", variant: "ghost", onClick: (_e, cx) => this.addComment(cx, p) })))
+      .when(e.exists, (x) => x.child(Button("rv-preview", { label: showPreview ? "Edit" : "Preview", icon: showPreview ? "pencil" : "eye", size: "sm", variant: "ghost", tooltip: showPreview ? "Back to editing" : "What GitHub will get", onClick: (_e, cx) => { showPreview ? this.preview.delete(keyOf(p)) : this.preview.add(keyOf(p)); cx.notify(); } })))
+      .child(div().flex_1())
+      .child(Tabs("rv-verdict", { value: e.verdict, onChange: setVerdict, items: VERDICTS.map(([value, label]) => ({ value, label })) }))
+      .child(Button("rv-post", { label: this.busy === keyOf(p) ? "Posting…" : "Post review…", icon: "send", size: "sm", disabled: this.busy === keyOf(p) || empty || !gate.ok, tooltip: gate.ok ? "Asks before anything is sent" : gate.why, onClick: (_e, cx) => ((this.confirm = { p }), cx.notify()) }));
     const syncRow = this.syncRow(k, p, e);
     if (showPreview) {
       const verb = e.verdict === "APPROVE" ? "approved these changes" : e.verdict === "REQUEST_CHANGES" ? "requested changes" : "reviewed";
@@ -409,7 +435,7 @@ export class Drafts {
         }),
         div().text_size(TEXT.xs).text_color(k.dim).child(`${lines} line comment${lines === 1 ? "" : "s"} and ${replies} repl${replies === 1 ? "y" : "ies"}; empty ones are left out.`),
         syncRow,
-        h_flex().justify_end().child(actions),
+        toolbar,
       );
     }
     return frame(
@@ -433,9 +459,7 @@ export class Drafts {
           .children([this.whyPanel(k, p, r)].filter(Boolean)),
       ),
       syncRow,
-      !gate.ok ? h_flex().gap(6).items_center().child(Icon("circle-help", { size: 13, color: k.warning })).child(div().text_size(TEXT.xs).text_color(k.warning).child(gate.why)) : null,
-      h_flex().gap(8).items_center().child(Button("rv-add", { label: "Add a line comment", icon: "plus", size: "sm", variant: "ghost", onClick: (_e, cx) => this.addComment(cx, p) })).children([agentButton].filter(Boolean)).child(div().flex_1()).child(Tabs("rv-verdict", { value: e.verdict, onChange: setVerdict, items: VERDICTS.map(([value, label]) => ({ value, label })) })),
-      h_flex().justify_end().child(actions),
+      toolbar,
     );
   }
 }

@@ -250,7 +250,7 @@ QUIZ_SYSTEM = """You write a short quiz for an engineer who is about to put thei
 
 Write exactly {count} questions, multiple choice, four choices each, one right:
 - about half on the change itself ("behaviour": what happens now in a concrete case, before vs after; "design": why it is built this way or what it trades off; "risk": what could break and for whom). Use concrete inputs and situations from the code.
-- the rest on the draft's comments (none if it has none) ("comment", with "comment" set to the comment's index as given): does the comment's claim hold, what in the code makes it so, or what the right fix is. When a comment is wrong or overstated, the right answer says so. Do not leak the answer in the question.
+- the rest on the draft's comments (none if it has none) ("comment", with "comment" set to the comment's index as given): does the comment's claim hold, what in the code makes it so, or what the right fix is. When a comment is wrong or overstated, the right answer says so. Do not leak the answer in the question. Refer to a comment by what it says ("the comment on the drive count says…"), never by its index or as "draft comment [n]": the index is only for the "comment" field.
 Refer to a comment by its file and line or by what it says ("the comment on line 77 of qRadioEnvironmentTest.sh"), never by its number in brackets: the person sees the comment's code beside the question, not those numbers. For other questions "comment" is -1. "answer" is the index (0-3) of the right choice; place it at varying positions. Make the wrong choices plausible to someone who only skimmed. "explain": two or three sentences on why the answer is right, pointing at the code (file and line)."""
 
 

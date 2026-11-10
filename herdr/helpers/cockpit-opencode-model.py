@@ -3,7 +3,8 @@
 cockpit-opencode-model.py <folder> <provider/model>
 OpenCode's interactive command takes no model flag, so a model for a session is set the way OpenCode reads a project's: a
 `.opencode/opencode.jsonc` in the folder it starts in (`{"model": {"providerID", "model"}}`), kept out of git through the
-repository's info/exclude. An existing file that is not this script's is left alone. Prints {"ok": true} or {"error": ...}.
+repository's info/exclude. With oh-my-opencode-slim the session runs as its orchestrator, on the active preset's model,
+which wins over this one. An existing file that is not this script's is left alone. Prints {"ok": true} or {"error": ...}.
 """
 
 import json
@@ -35,6 +36,9 @@ def main():
     os.makedirs(d, exist_ok=True)
     with open(path, "w") as f:
         json.dump({MARK: True, "model": {"providerID": provider, "model": name}}, f, indent=2)
+    # Not yet: with oh-my-opencode-slim, the session runs as its orchestrator on the preset's model. A project
+    # .opencode/oh-my-opencode-slim.jsonc does switch the orchestrator's model, but the preset's reasoning variant still comes
+    # along and a gateway model without it fails, so the preset's model stays until that is solved.
     ex = subprocess.run(["git", "-C", folder, "rev-parse", "--git-path", "info/exclude"], capture_output=True, text=True).stdout.strip()
     if ex:
         ex = ex if os.path.isabs(ex) else os.path.join(folder, ex)

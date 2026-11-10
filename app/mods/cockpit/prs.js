@@ -12,7 +12,7 @@ import { loadPrs, prs, prsConfig, ago } from "./prsdata.js";
 import { urgent, urgency, reviewOf } from "./prcards.js";
 import { ModelPicker } from "./modelpick.js";
 import { openSettings } from "./settings.js";
-import { quizChip, gateFor } from "./quizinfo.js";
+import { quizChip, gateFor, quizOf } from "./quizinfo.js";
 import { Drafts } from "./prreview.js";
 import { PrFiles, parsePatch } from "./prfiles.js";
 import { installedEditors, openInEditor } from "./editors.js";
@@ -77,6 +77,7 @@ export default class Prs {
     this.drafts.modelOf = () => this.explainModel.value();
     // Posting waits for a passed quiz when quiz.gate is on; the way there is Quiz me.
     this.drafts.gateOf = (p) => gateFor(keyOf(p));
+    this.drafts.quizOf = (p) => quizOf(keyOf(p));
     this.drafts.toQuiz = (p, cx) => { this.view = "quiz"; this.loadQuiz(cx, p); cx.notify(); };
     this.jobs = new Map(); // "explain:<key>" | "quiz:<key>" -> {kind, p, model, at}: running in the background
     cx.timer.every(3000, (cx) => this.pollJobs(cx));
@@ -1014,7 +1015,7 @@ export default class Prs {
           p.unresolved ? div().text_size(TEXT.xs).text_color(k.dim).child(`${p.unresolved} unresolved review thread${p.unresolved === 1 ? "" : "s"}`) : null,
         ),
       )
-      .child(this.drafts.section(k, p, { agentButton: Button("rv-agent", { label: p.role === "author" ? "Draft replies with an agent…" : "Draft a review with an agent…", icon: "bot", size: "sm", variant: "outline", tooltip: "An agent reads the PR and writes a draft here. Nothing is posted.", onClick: () => openMenu(LAUNCH_AGENTS.map((a) => ({ label: a.label, icon: "bot", command: `prs:${p.role === "author" ? "fix" : p.turn?.why === "re-review" ? "rereview" : "review"}:${a.id}:${keyOf(p)}` })), { width: 220 }) }) }))
+      .child(this.drafts.section(k, p, { agentButton: Button("rv-agent", { label: p.role === "author" ? "Replies with an agent" : "Draft with an agent", icon: "bot", size: "sm", variant: "ghost", tooltip: "An agent reads the PR and writes a draft here. Nothing is posted.", onClick: () => openMenu(LAUNCH_AGENTS.map((a) => ({ label: a.label, icon: "bot", command: `prs:${p.role === "author" ? "fix" : p.turn?.why === "re-review" ? "rereview" : "review"}:${a.id}:${keyOf(p)}` })), { width: 220 }) }) }))
       .children([this.repliesSection(k, p)].filter(Boolean))
       .child(section(`Conversation`, this.conversation(k, p)))
       .child(
@@ -1043,18 +1044,23 @@ export default class Prs {
           gap: 10,
           title: "Work on it with an agent",
           children: [
-            div().text_size(TEXT.xs).text_color(k.dim).child("Task"),
-            taskRow,
-            div().text_size(TEXT.xs).text_color(k.dim).child("Agent"),
-            agentRow,
-            div().text_size(TEXT.xs).text_color(k.dim).child(`Model${this.models.length ? ` · ${this.models.length} on the gateway` : ""}`),
-            h_flex().gap(6).items_center().child(TextField(this.model)).child(Button("prs-model-toggle", { icon: this.modelOpen ? "chevron-up" : "chevron-down", variant: "outline", size: "icon-sm", tooltip: "The gateway's models", onClick: (_e, cx) => ((this.modelOpen = !this.modelOpen), cx.notify()) })),
+            // The task, then who does it on which model, and Start: one line each.
+            h_flex().gap(10).items_center().child(div().w(52).flex_none().text_size(TEXT.xs).text_color(k.dim).child("Task")).child(taskRow),
+            h_flex().gap(10).items_center().child(div().w(52).flex_none().text_size(TEXT.xs).text_color(k.dim).child("Agent")).child(agentRow),
+            h_flex().gap(10).items_center()
+              .child(div().w(52).flex_none().text_size(TEXT.xs).text_color(k.dim).child("Model"))
+              .child(div().flex_1().min_w(0).child(TextField(this.model)))
+              .child(Button("prs-model-toggle", { icon: this.modelOpen ? "chevron-up" : "chevron-down", variant: "outline", size: "icon-sm", tooltip: `The gateway's ${this.models.length || ""} models`, onClick: (_e, cx) => ((this.modelOpen = !this.modelOpen), cx.notify()) }))
+              .child(Button("prs-start", { label: `Start ${LAUNCH_AGENTS.find((a) => a.id === this.agent)?.label ?? this.agent}`, icon: "play", size: "sm", onClick: (_e, cx) => this.start(cx, p, task) })),
             this.modelList(k),
             this.agent === "opencode" && here?.presets?.length
-              ? v_flex().gap(6).child(div().text_size(TEXT.xs).text_color(k.dim).child("OMO preset (this computer; new sessions use it)")).child(h_flex().gap(6).flex_wrap().children(here.presets.map((n) => Button(`prs-omo-${n}`, { label: n, size: "sm", variant: n === here.preset ? "default" : "outline", onClick: (_e, cx) => cx.spawn(async (cx) => { const r = await this.omo.set(null, n); notify({ title: r.error ? "Could not change the preset" : "OMO preset", body: r.error ?? r.note }); cx.notify(); }) }))))
+              ? h_flex().gap(10).items_center().child(div().w(52).flex_none().text_size(TEXT.xs).text_color(k.dim).child("Preset")).child(h_flex().gap(6).flex_wrap().children(here.presets.map((n) => Button(`prs-omo-${n}`, { label: n, size: "sm", variant: n === here.preset ? "default" : "ghost", onClick: (_e, cx) => cx.spawn(async (cx) => { const r = await this.omo.set(null, n); notify({ title: r.error ? "Could not change the preset" : "OMO preset", body: r.error ?? r.note }); cx.notify(); }) }))))
               : null,
-            Button("prs-start", { label: `Start ${LAUNCH_AGENTS.find((a) => a.id === this.agent)?.label ?? this.agent}`, size: "sm", onClick: (_e, cx) => this.start(cx, p, task) }),
-            div().text_size(TEXT.xs).text_color(k.dim).child("It starts in a new tab in the repository's folder. Nothing is posted to GitHub."),
+            div().text_size(TEXT.xs).text_color(k.dim).whitespace_normal().child(
+              this.agent === "opencode" && here?.preset
+                ? `OpenCode runs as OMO's orchestrator on the ${here.preset} preset's models: pick another preset above; a model typed here is not used while OMO is on. It starts in a new tab in the PR's worktree; nothing is posted to GitHub.`
+                : "It starts in a new tab in the PR's worktree. Nothing is posted to GitHub.",
+            ),
           ].filter(Boolean),
         }),
       );
