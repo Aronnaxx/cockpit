@@ -136,12 +136,15 @@ def fill(slug, number):
 
 
 def explain_pr(slug, number, model):
+    stage("Reading the pull request")
     meta = json.loads(gh("pr", "view", str(number), "-R", slug, "--json", "title,body,headRefOid,baseRefName,headRefName,author"))
     diff = gh("pr", "diff", str(number), "-R", slug, timeout=120)
     stats = file_stats(diff)
     body = (meta.get("body") or "")[:6000]
     prompt = f"Pull request {slug}#{number}: {meta['title']}\nBy {meta.get('author', {}).get('login')}, {meta['headRefName']} into {meta['baseRefName']}.\n\nDescription:\n{body or '(none)'}\n\nFiles (+added -removed):\n" + "\n".join(f"{p} +{a} -{r}" for p, (a, r) in stats.items()) + f"\n\nThe diff:\n{diff[:160000]}" + ("\n(the diff is cut here)" if len(diff) > 160000 else "")
+    stage(f"Asking {model}")
     text, _ = cockpit_gateway.ask(model, [{"role": "system", "content": PR_SYSTEM + "\n\nThe JSON schema:\n" + json.dumps(PR_SCHEMA)}, {"role": "user", "content": prompt}], max_tokens=16000, schema=PR_SCHEMA)
+    stage("Counting the lines per area")
     d = cockpit_gateway.as_json(text)
     counted(d, stats)
     d.update(model=model, head=meta["headRefOid"], at=int(time.time() * 1000))
@@ -296,9 +299,11 @@ def quiz_shape(stats, comments):
 
 
 def quiz(slug, number, model, missed=None):
+    stage("Reading the pull request")
     meta = json.loads(gh("pr", "view", str(number), "-R", slug, "--json", "title,body,headRefOid"))
     diff = gh("pr", "diff", str(number), "-R", slug, timeout=120)
     name = f"{slug.replace('/', '__')}__{number}.json"
+    stage("Reading the review draft")
     try:
         draft = json.load(open(os.path.join(DRAFTS, name)))
     except Exception:
@@ -309,8 +314,10 @@ def quiz(slug, number, model, missed=None):
     prompt = f"Pull request {slug}#{number}: {meta['title']}\n\n{(meta.get('body') or '')[:4000]}\n\nThe draft's comments:\n{listed or '(none: ask only about the change)'}\n\nThe diff:\n{diff[:150000]}"
     if missed:
         prompt += "\n\nLast time the person got these wrong. Ask about the same parts of the code again, in new ways (other cases, other angles), without repeating these questions:\n" + "\n".join(f"- {m}" for m in missed[:10])
+    stage(f"Asking {model} for {count} questions")
     system = QUIZ_SYSTEM.replace("{count}", str(count)) + "\n\n" + LEVELS[level] + "\n\nThe JSON schema:\n" + json.dumps(QUIZ_SCHEMA)
     text, _ = cockpit_gateway.ask(model, [{"role": "system", "content": system}, {"role": "user", "content": prompt}], max_tokens=16000, schema=QUIZ_SCHEMA)
+    stage("Checking the answers")
     d = cockpit_gateway.as_json(text)
     by = dict(comments)
     qs = []
@@ -355,24 +362,60 @@ def quiz(slug, number, model, missed=None):
     return out
 
 
+MARKER = {}
+STAGES = {
+    "quiz": ["Reading the pull request", "Reading the review draft", "Asking the model", "Checking the answers"],
+    "explain": ["Reading the pull request", "Asking the model", "Counting the lines per area"],
+}
+
+
+def stage(name):
+    """Where a marked job is now, written into its marker for the PR page's progress bar."""
+    if not MARKER.get("path"):
+        return
+    MARKER["data"].update(stage=name, stage_at=int(time.time() * 1000))
+    try:
+        with open(MARKER["path"] + ".tmp", "w") as f:
+            json.dump(MARKER["data"], f)
+        os.replace(MARKER["path"] + ".tmp", MARKER["path"])
+    except Exception:
+        pass
+
+
 def marked(kind, slug, number, model, fn):
-    """Runs `fn` with a marker beside its file while it works (<name>.running: {model, pid, at}), so the PR page shows it in
-    progress from any copy, and leaves <name>.error when it fails; meant to run detached (nohup ... &)."""
+    """Runs `fn` with a marker beside its file while it works (<name>.running: {model, pid, at, stage, stages}), so the PR
+    page shows it in progress from any copy, and leaves <name>.error when it fails; meant to run detached (nohup ... &). A
+    run that succeeds adds its time to <kind>/.timings.json (the last ten per model), which the page's bar is measured by."""
     folder = os.path.join(os.path.expanduser("~/.cache/cockpit"), kind)
     os.makedirs(folder, exist_ok=True)
     name = os.path.join(folder, f"{slug.replace('/', '__')}__{number}.json")
     for old in (name + ".error",):
         if os.path.exists(old):
             os.remove(old)
-    with open(name + ".running", "w") as f:
-        json.dump({"model": model, "pid": os.getpid(), "at": int(time.time() * 1000)}, f)
+    started = time.time()
+    MARKER.update(path=name + ".running", data={"model": model, "pid": os.getpid(), "at": int(started * 1000), "stages": STAGES.get(kind, []), "stage": None})
+    stage((STAGES.get(kind) or ["Starting"])[0])
     try:
-        return fn()
+        out = fn()
+        try:
+            tpath = os.path.join(folder, ".timings.json")
+            try:
+                t = json.load(open(tpath))
+            except Exception:
+                t = {}
+            t[model] = (t.get(model) or [])[-9:] + [round(time.time() - started, 1)]
+            with open(tpath + ".tmp", "w") as f:
+                json.dump(t, f)
+            os.replace(tpath + ".tmp", tpath)
+        except Exception:
+            pass
+        return out
     except Exception as e:
         with open(name + ".error", "w") as f:
             json.dump({"error": str(e)[:400], "model": model, "at": int(time.time() * 1000)}, f)
         raise
     finally:
+        MARKER.clear()
         if os.path.exists(name + ".running"):
             os.remove(name + ".running")
 

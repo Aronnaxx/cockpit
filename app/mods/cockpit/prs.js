@@ -54,8 +54,9 @@ export default class Prs {
     // The gateway's models, searched as you type (bin/cockpit-models.py).
     this.models = [];
     this.modelOpen = false;
-    this.model.on("focus", (_e, cx) => ((this.modelOpen = true), cx.notify()));
-    this.model.on("change", (_e, cx) => ((this.modelOpen = true), cx.notify()));
+    // The list shows every model when it opens; it filters only once the text differs from what it held then.
+    this.model.on("focus", (_e, cx) => ((this.modelOpen = true), (this.modelOpenedWith = this.model.value().trim()), cx.notify()));
+    this.model.on("change", (_e, cx) => { if (!this.modelOpen) this.modelOpenedWith = null; this.modelOpen = true; cx.notify(); });
     cx.spawn(async (cx) => {
       try {
         const { home } = await hub.install();
@@ -244,6 +245,8 @@ export default class Prs {
   /** An explanation or a quiz (bin/cockpit-explain.py), detached: it keeps going when you leave the page, and any copy of the page
    *  sees it through its marker file. */
   startJob(cx, kind, p, model = this.jobModel(), extra = []) {
+    // One at a time per pull request and kind: a new one (another model, say) stops the one running.
+    if (this.jobs.has(`${kind}:${keyOf(p)}`)) this.stopJob(cx, kind, p, { quiet: true });
     const map = kind === "quiz" ? this.quiz : this.explain;
     map.set(keyOf(p), "loading");
     this.jobs.set(`${kind}:${keyOf(p)}`, { kind, p, model, at: Date.now() });
@@ -255,16 +258,74 @@ export default class Prs {
     });
   }
 
-  /** Jobs still running: done when their marker is gone (the result, or the error, is then read). */
+  /** A job's marker file: its model, pid, start, stage and stages, and whether its process is still there (a marker whose
+   *  process died, or that is over fifteen minutes old, is stale). */
+  async marker(home, kind, p) {
+    const path = `${home}/.cache/cockpit/${kind === "quiz" ? "quiz" : "explain"}/${p.repo.replace("/", "__")}__${p.number}.json.running`;
+    const text = await readTextFile(path).catch(() => null);
+    if (text === null) return null;
+    let m = {};
+    try {
+      m = JSON.parse(text || "{}");
+    } catch {}
+    const alive = m.pid ? (await exec("kill", ["-0", String(m.pid)]).catch(() => ({ code: 1 }))).code === 0 : false;
+    return { ...m, path, alive: alive && Date.now() - (m.at ?? 0) < 15 * 60000 };
+  }
+
+  /** How long a model usually takes for this kind of job (the median of its last runs), in ms, or null. */
+  typical(kind, model) {
+    const runs = this.timings?.[kind]?.[model] ?? [];
+    if (!runs.length) return null;
+    const sorted = [...runs].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)] * 1000;
+  }
+
+  /** Stops a running job: its process, then its marker. The page falls back to what was there before. */
+  stopJob(cx, kind, p, { quiet = false } = {}) {
+    const id = `${kind}:${keyOf(p)}`;
+    const j = this.jobs.get(id);
+    this.jobs.delete(id);
+    const map = kind === "quiz" ? this.quiz : this.explain;
+    map.delete(keyOf(p));
+    cx.spawn(async (cx) => {
+      const { home } = await hub.install();
+      const m = await this.marker(home, kind, p);
+      if (m?.pid) await exec("kill", [String(m.pid)]).catch(() => {});
+      if (m?.path) await exec("rm", ["-f", m.path]).catch(() => {});
+      if (!quiet) (kind === "quiz" ? this.loadQuiz(cx, p) : this.loadExplain(cx, p));
+      cx.notify();
+    });
+    return j;
+  }
+
+  /** Jobs still running: their marker read for the progress bar; done when it is gone (the result, or the error, is then
+   *  read); a marker whose process died is cleared and said so. */
   pollJobs(cx) {
     if (!this.jobs.size) return;
     cx.spawn(async (cx) => {
       const { home } = await hub.install();
+      for (const kind of ["quiz", "explain"]) {
+        const t = await readTextFile(`${home}/.cache/cockpit/${kind}/.timings.json`).catch(() => null);
+        try {
+          if (t) (this.timings ??= {})[kind] = JSON.parse(t);
+        } catch {}
+      }
       for (const [id, j] of [...this.jobs]) {
         if (Date.now() - j.at < 2500) continue;
-        const base = `${home}/.cache/cockpit/${j.kind === "quiz" ? "quiz" : "explain"}/${j.p.repo.replace("/", "__")}__${j.p.number}.json`;
-        if ((await readTextFile(`${base}.running`).catch(() => null)) !== null) continue;
         const map = j.kind === "quiz" ? this.quiz : this.explain;
+        const m = await this.marker(home, j.kind, j.p);
+        if (m && m.alive) {
+          j.marker = m;
+          continue;
+        }
+        if (m && !m.alive) {
+          await exec("rm", ["-f", m.path]).catch(() => {});
+          map.set(keyOf(j.p), { error: `${m.model ?? "The job"} stopped without an answer${m.stage ? ` (at: ${m.stage.toLowerCase()})` : ""}. Try again, or pick another model.` });
+          this.jobs.delete(id);
+          cx.notify();
+          continue;
+        }
+        const base = `${home}/.cache/cockpit/${j.kind === "quiz" ? "quiz" : "explain"}/${j.p.repo.replace("/", "__")}__${j.p.number}.json`;
         const err = await readTextFile(`${base}.error`).catch(() => null);
         const text = await readTextFile(base).catch(() => null);
         try {
@@ -279,9 +340,34 @@ export default class Prs {
           map.set(keyOf(j.p), { error: "its answer could not be read" });
         }
         this.jobs.delete(id);
-        cx.notify();
       }
+      // The bar moves with the time: a redraw per poll while anything runs.
+      cx.notify();
     });
+  }
+
+  /** A running job, as the Quiz and Explain pages show it: its model, its stage among its stages, and a bar of the time
+   *  gone against what that model usually takes; Stop. */
+  jobBlock(k, kind, p) {
+    const j = this.jobs.get(`${kind}:${keyOf(p)}`);
+    const m = j?.marker ?? {};
+    const model = m.model ?? j?.model ?? this.jobModel();
+    const started = m.at ?? j?.at ?? Date.now();
+    const gone = Math.max(0, Date.now() - started);
+    const usual = this.typical(kind, model);
+    const mmss = (ms) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, "0")}`;
+    const stages = m.stages ?? [];
+    // The stage written ("Asking <model> for 6 questions") against the list ("Asking the model").
+    const at = Math.max(0, stages.findIndex((x) => x === m.stage || (x === "Asking the model" && String(m.stage ?? "").startsWith("Asking "))));
+    return v_flex().gap(10).p(16).rounded(RADIUS.lg).border_1().border_color(k.border).bg(k.card)
+      .child(h_flex().gap(8).items_center()
+        .child(Spinner({ size: 13 }))
+        .child(div().flex_1().min_w(0).truncate().text_size(TEXT.sm).font_medium().text_color(k.foreground).child(m.stage ?? `Starting ${model}…`))
+        .child(Mono(usual ? `${mmss(gone)} of about ${mmss(usual)}` : mmss(gone), { size: TEXT.xs, color: k.mutedFg }))
+        .child(Button(`prs-${kind}-stop`, { label: "Stop", size: "sm", variant: "ghost", onClick: (_e, cx) => this.stopJob(cx, kind, p) })))
+      .child(Progress(usual ? Math.min(0.95, gone / usual) : Math.min(0.9, (at + 0.5) / Math.max(1, stages.length || 3)), { h: 6 }))
+      .when(stages.length > 0, (e) => e.child(h_flex().gap(12).flex_wrap().children(stages.map((x, i) => h_flex().id(`job-st-${kind}-${i}`).gap(4).items_center().child(Icon(i < at ? "check" : i === at ? "chevron-right" : "circle", { size: 11, color: i < at ? k.success : i === at ? k.foreground : k.dim })).child(div().text_size(TEXT.xs).text_color(i <= at ? k.foreground : k.dim).child(x === "Asking the model" ? `Asking ${model}` : x))))))
+      .child(div().text_size(TEXT.xs).text_color(k.dim).child(usual ? `${model} usually takes about ${mmss(usual)} here. It keeps going if you leave this page.` : `It keeps going if you leave this page. Picking another model and pressing ${kind === "quiz" ? "New quiz" : "Explain again"} stops this one.`));
   }
 
   /** Without being asked: an explanation for the pull request you open, and an explanation and a quiz for every one with a
@@ -308,7 +394,13 @@ export default class Prs {
         if ((kind === "quiz" && ex.auto_quiz === false) || (kind === "explain" && ex.auto === false)) continue;
         const set = kind === "quiz" ? qz : exp;
         const map = kind === "quiz" ? this.quiz : this.explain;
-        if (set.has(name(p)) || set.has(`${name(p)}.running`) || set.has(`${name(p)}.error`) || this.jobs.has(`${kind}:${keyOf(p)}`) || map.get(keyOf(p)) === "loading") continue;
+        if (set.has(name(p)) || set.has(`${name(p)}.error`) || this.jobs.has(`${kind}:${keyOf(p)}`) || map.get(keyOf(p)) === "loading") continue;
+        if (set.has(`${name(p)}.running`)) {
+          // A marker whose process is gone does not count as a job.
+          const m = await this.marker(home, kind, p);
+          if (m?.alive) continue;
+          if (m?.path) await exec("rm", ["-f", m.path]).catch(() => {});
+        }
         this.startJob(cx, kind, p, ex.model ?? "agy/gemini-3.8-flash-medium");
       }
     });
@@ -541,8 +633,9 @@ export default class Prs {
   /** The searchable list under the model field: the gateway's models that match what is typed. */
   modelList(k) {
     if (!this.modelOpen) return null;
-    const q = this.model.value().trim().toLowerCase();
-    const hits = (q ? this.models.filter((m) => m.toLowerCase().includes(q)) : this.models).slice(0, 60);
+    const cur = this.model.value().trim();
+    const q = cur !== this.modelOpenedWith ? cur.toLowerCase() : "";
+    const hits = (q ? this.models.filter((m) => m.toLowerCase().includes(q)) : [...this.models.filter((m) => m === cur), ...this.models.filter((m) => m !== cur)]).slice(0, 80);
     if (!hits.length) return div().text_size(TEXT.xs).text_color(k.dim).child(this.models.length ? "No gateway model matches: it is used as typed." : "The gateway's models could not be read (set litellm.base_url in the config): type one.");
     return v_flex()
       .id("model-list")
@@ -657,9 +750,9 @@ export default class Prs {
         .when(ready && x.head !== p.head, (e) => e.child(Badge("written for an older head", "warning")))
         .when(ready, (e) => e.child(div().text_size(TEXT.xs).text_color(k.dim).child(`${x.by_agent ? "written while reviewing by " : ""}${x.model ?? "?"}${x.at ? ` · ${ago(x.at)} ago` : ""}`))))
       .child(div().text_size(TEXT.xs).text_color(k.mutedFg).child("A model of the gateway reads the description and the whole diff against the base, and explains it: it does not judge it. The lines changed per area are counted from the diff."))
-      .child(h_flex().gap(8).items_start().child(div().flex_1().min_w(0).child(this.explainModel.element(k, "explain"))).child(Button("prs-explain-go", { label: x === "loading" ? "Explaining…" : ready ? "Explain again" : "Explain", icon: "sparkles", size: "sm", disabled: x === "loading" || !this.explainModel.value(), tooltip: this.explainModel.value() ? undefined : "Pick a model first", onClick: (_e, cx) => this.writeExplain(cx, p) })));
+      .child(h_flex().gap(8).items_start().child(div().flex_1().min_w(0).child(this.explainModel.element(k, "explain"))).child(Button("prs-explain-go", { label: x === "loading" ? "Restart with this model" : ready ? "Explain again" : "Explain", icon: "sparkles", size: "sm", disabled: !this.explainModel.value(), tooltip: this.explainModel.value() ? undefined : "Pick a model first", onClick: (_e, cx) => this.writeExplain(cx, p) })));
     if (!x) return v_flex().gap(12).child(head);
-    if (x === "loading") return v_flex().gap(12).child(head).child(h_flex().h(120).justify_center().items_center().gap(8).text_color(k.mutedFg).child(Spinner({ size: 14 })).child(`${this.explainModel.value()} is reading the diff… a big pull request takes a few minutes.`));
+    if (x === "loading") return v_flex().gap(12).child(head).child(this.jobBlock(k, "explain", p));
     if (x.error) return v_flex().gap(12).child(head).child(div().p(10).rounded(RADIUS.md).bg(alpha(k.destructive, 0.1)).text_size(TEXT.sm).text_color(k.foreground).child(x.error));
     const areas = x.areas ?? [];
     const max = Math.max(1, ...areas.map((a) => (a.added ?? 0) + (a.removed ?? 0)));
@@ -852,9 +945,9 @@ export default class Prs {
         .when(Boolean(sc), (e) => e.child(Badge(atEnd && sc.answered < sc.total ? `${sc.answered} of ${sc.total} answered` : sc.answered < sc.total ? `${sc.answered} of ${sc.total} answered · ${sc.right} right${sc.answered - sc.right ? ` · ${sc.answered - sc.right} wrong` : ""}` : `${sc.right} of ${sc.total} right`, sc.answered < sc.total ? "secondary" : sc.right / sc.total >= passMark / 100 ? "success" : "warning"))))
       .child(div().text_size(TEXT.xs).text_color(k.mutedFg).child("Before your name goes on the review: what the change does, how it behaves, and whether the agent's comments hold up. Answer first; the why shows after."))
       .when(Boolean(ready), (e) => e.child(h_flex().gap(6).items_center().child(Badge(`${{ basics: "Basics", standard: "Standard", deep: "Deep" }[x.difficulty] ?? "Standard"} · ${x.questions.length} questions`, "secondary")).when(Boolean(x.focus), (y) => y.child(Badge("on what you missed", "info"))).child(Button("prs-quiz-settings", { label: "Difficulty and length…", size: "sm", variant: "ghost", tooltip: "In Cockpit settings: AI", onClick: () => openSettings("ai") }))))
-      .child(h_flex().gap(8).items_start().child(div().flex_1().min_w(0).child(this.explainModel.element(k, "quiz"))).child(Button("prs-quiz-go", { label: x === "loading" ? "Writing…" : ready ? "New quiz" : "Write the quiz", icon: "sparkles", size: "sm", disabled: x === "loading" || !this.explainModel.value(), tooltip: this.explainModel.value() ? undefined : "Pick a model first", onClick: (_e, cx) => this.writeQuiz(cx, p) })));
+      .child(h_flex().gap(8).items_start().child(div().flex_1().min_w(0).child(this.explainModel.element(k, "quiz"))).child(Button("prs-quiz-go", { label: x === "loading" ? "Restart with this model" : ready ? "New quiz" : "Write the quiz", icon: "sparkles", size: "sm", disabled: !this.explainModel.value(), tooltip: this.explainModel.value() ? undefined : "Pick a model first", onClick: (_e, cx) => this.writeQuiz(cx, p) })));
     if (!x) return v_flex().gap(12).child(head);
-    if (x === "loading") return v_flex().gap(12).child(head).child(h_flex().h(120).justify_center().items_center().gap(8).text_color(k.mutedFg).child(Spinner({ size: 14 })).child(`${this.explainModel.value()} is reading the diff and the draft…`));
+    if (x === "loading") return v_flex().gap(12).child(head).child(this.jobBlock(k, "quiz", p));
     if (x.error) return v_flex().gap(12).child(head).child(div().p(10).rounded(RADIUS.md).bg(alpha(k.destructive, 0.1)).text_size(TEXT.sm).child(x.error));
     const ABOUT = { behaviour: "How it behaves", design: "Why it is built this way", risk: "What could break", comment: "An agent's comment" };
     const answers = x.answers ?? {};
@@ -1127,7 +1220,7 @@ export default class Prs {
             h_flex().gap(10).items_center()
               .child(div().w(52).flex_none().text_size(TEXT.xs).text_color(k.dim).child("Model"))
               .child(div().flex_1().min_w(0).child(TextField(this.model)))
-              .child(Button("prs-model-toggle", { icon: this.modelOpen ? "chevron-up" : "chevron-down", variant: "outline", size: "icon-sm", tooltip: `The gateway's ${this.models.length || ""} models`, onClick: (_e, cx) => ((this.modelOpen = !this.modelOpen), cx.notify()) }))
+              .child(Button("prs-model-toggle", { icon: this.modelOpen ? "chevron-up" : "chevron-down", variant: "outline", size: "icon-sm", tooltip: `The gateway's ${this.models.length || ""} models`, onClick: (_e, cx) => ((this.modelOpen = !this.modelOpen), (this.modelOpenedWith = this.model.value().trim()), cx.notify()) }))
               .child(Button("prs-start", { label: `Start ${LAUNCH_AGENTS.find((a) => a.id === this.agent)?.label ?? this.agent}`, icon: "play", size: "sm", onClick: (_e, cx) => this.start(cx, p, task) })),
             this.modelList(k),
             this.agent === "opencode" && here?.presets?.length

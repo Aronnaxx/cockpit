@@ -24,7 +24,7 @@ def _cfg():
 
 def ask(model, messages, max_tokens=16000, timeout=590, schema=None):
     """The answer's text. `schema`: a JSON schema the answer must follow (sent as response_format; a gateway model that
-    refuses it is asked again with plain JSON mode)."""
+    refuses it, or answers nothing, is asked again with plain JSON mode, then with no format)."""
     ll = _cfg()
     key_file = os.path.expanduser(ll.get("key_file") or next(iter(sorted(glob.glob(os.path.expanduser("~/.config/litellm/keys/opencode-*.key")))), ""))
     key = open(key_file, encoding="utf-8").read().strip() if key_file and os.path.exists(key_file) else ""
@@ -49,7 +49,11 @@ def ask(model, messages, max_tokens=16000, timeout=590, schema=None):
         text = ((d.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
         text = re.sub(r"(?s)<think>.*?</think>", "", text).strip()
         if not text:
-            raise RuntimeError(f"{model} gave an empty answer")
+            # Some models answer nothing under a response format: the same question again in the next, looser one.
+            last = RuntimeError(f"{model} gave an empty answer")
+            if fmt:
+                continue
+            raise last
         return text, d.get("usage") or {}
     raise last or RuntimeError(f"{model}: no answer")
 
