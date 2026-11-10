@@ -28,6 +28,8 @@ const TASKS = {
 export default class Prs {
   init(_p, cx) {
     this.sel = null;
+    // As a pane beside an agent (beside.js): one pull request, opened once the list is read; no page header.
+    this.docked = _p?.docked ? _p.pr ?? null : null;
     this.scope = "review";
     this.scopeAt = null;
     this.q = InputState.new({ placeholder: "Filter: a repo, a title, a person…" });
@@ -86,6 +88,13 @@ export default class Prs {
         await loadPrs({ force });
         this.cfg = await prsConfig();
         this.busy = null;
+        if (this.docked && !this.dockedOpen) {
+          const hit = this.list().find((x) => keyOf(x) === this.docked);
+          if (hit) {
+            this.dockedOpen = true;
+            this.select(cx, hit);
+          }
+        }
         cx.notify();
       });
     this.pull = pull;
@@ -711,6 +720,7 @@ export default class Prs {
           .child(
             h_flex()
               .gap(6)
+              .flex_wrap()
               .pt(4)
               .child(Button("prs-open", { label: "Open PR", icon: "external", size: "sm", variant: "outline", onClick: (_e, cx) => cx.spawn(async () => hub.openUrl(p.url)) }))
               .child(Button("prs-files", { label: `Files changed${this.pfiles.files(p) ? ` · ${this.pfiles.files(p).length}` : ""}`, icon: "git-commit", size: "sm", variant: "outline", tooltip: "Every changed file as a diff or in full; click a line to comment on it", onClick: (_e, cx) => { this.view = "files"; this.pfiles.load(cx, p); this.drafts.load(cx, p).then((c) => c && cx.notify()); cx.notify(); } }))
@@ -806,13 +816,13 @@ export default class Prs {
     const list = this.list();
     const order = (a, b) => (urgency(b) - urgency(a)) || (b.turn?.who === "you") - (a.turn?.who === "you") || b.last_activity - a.last_activity;
     // Home's "Details" leaves the pull request to open in this shared value.
-    const sc = shared("cockpit.prs.scope");
+    const sc = this.docked ? null : shared("cockpit.prs.scope");
     if (sc && sc.at !== this.scopeAt) {
       this.scopeAt = sc.at;
       this.scope = sc.scope;
       this.repoF = null;
     }
-    const want = shared("cockpit.prs.focus");
+    const want = this.docked ? null : shared("cockpit.prs.focus");
     if (!want) this.focused = null;
     if (want && want !== this.focused) {
       this.focused = want;
@@ -892,7 +902,16 @@ export default class Prs {
       .bg(k.background)
       .text_color(k.foreground)
       .text_size(TEXT.base)
-      .child(
+      .when(Boolean(this.docked), (e) =>
+        e.child(
+          h_flex().flex_none().h(36).px(12).gap(8).items_center().border_b_1().border_color(k.border).bg(k.muted)
+            .child(Icon("git-pull-request", { size: 14, color: k.mutedFg }))
+            .child(Mono(this.docked, { size: TEXT.xs, color: k.mutedFg }))
+            .child(div().flex_1())
+            .child(Button("prs-dock-full", { label: "Open in Pull requests", icon: "external", size: "sm", variant: "ghost", tooltip: "This pull request on the Pull requests page, full width", onClick: () => { const hit = list.find((x) => keyOf(x) === this.docked); if (hit) { setShared("cockpit.prs.scope", { scope: hit.role === "author" ? "mine" : "review", at: Date.now() }); setShared("cockpit.prs.focus", keyOf(hit)); run("layout.select", { stack: "center", child: "prs" }); setShared("cockpit.app", "prs"); } } })),
+        ),
+      )
+      .when(!this.docked, (e) => e.child(
         PageHeader({
           icon: "git-pull-request",
           title: "Pull requests",
@@ -900,7 +919,7 @@ export default class Prs {
           aside: d ? Badge(yours ? `${yours} on you` : "nothing on you", yours ? "warning" : "success") : null,
           actions: [Button("prs-refresh", { label: this.busy === "refresh" ? "Asking…" : "Refresh", icon: "rotate-ccw", variant: "outline", size: "sm", disabled: this.busy === "refresh", onClick: (_e, cx) => this.pull(cx, true) })],
         }),
-      )
+      ))
       .child(
         !d
           ? h_flex().h(160).justify_center().items_center().gap(8).text_color(k.mutedFg).child(Spinner({ size: 14 })).child("Asking GitHub…")
@@ -948,7 +967,7 @@ export default class Prs {
                   .px(24)
                   .py(16)
                   .gap(12)
-                  .child(h_flex().gap(8).items_center().child(Button("prs-back", { label: this.view === "files" ? sel.title : "Pull requests", icon: "chevron-left", variant: "ghost", size: "sm", onClick: (_e, cx) => (this.view === "files" ? (this.view = null) : ((this.sel = null), setShared("cockpit.prs.focus", null)), cx.notify()) })).when(this.view === "files", (e) => e.child(div().text_size(TEXT.sm).font_semibold().child("Files changed"))))
+                  .child(h_flex().gap(8).items_center().child(Button("prs-back", { label: this.view === "files" ? sel.title : "Pull requests", icon: "chevron-left", variant: "ghost", size: "sm", onClick: (_e, cx) => (this.view === "files" ? (this.view = null) : ((this.sel = null), this.docked || setShared("cockpit.prs.focus", null)), cx.notify()) })).when(this.view === "files", (e) => e.child(div().text_size(TEXT.sm).font_semibold().child("Files changed"))))
                   .child(this.view === "files" ? this.pfiles.render(k, sel, this.drafts, this.cfg) : this.detail(k, sel, cx))
               : listView,
       )

@@ -107,7 +107,20 @@ def load_of(procs, pane, address=None):
                 mine.add(k)
                 todo.append(k)
     rows = [p for p in procs if p[0] in mine]
-    return {"cpu": round(sum(p[2] for p in rows)), "mem": round(sum(p[3] for p in rows) / 1024), "procs": len(rows)}
+    return {"cpu": round(sum(p[2] for p in rows)), "mem": round(sum(p[3] for p in rows) / 1024), "procs": len(rows), "_pids": sorted(mine)}
+
+
+def claude_session_of(pids):
+    """A running Claude Code's session, as it records it: ~/.claude/sessions/<pid>.json ({sessionId, cwd, name}) for one of the
+    agent's processes. Exact where the hub has none (an agent on another machine)."""
+    for pid in pids or []:
+        try:
+            d = json.load(open(os.path.expanduser(f"~/.claude/sessions/{pid}.json")))
+            if d.get("sessionId"):
+                return d["sessionId"]
+        except Exception:
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -506,12 +519,19 @@ def main():
     for a in wanted:
         prog = str(a.get("program") or "").lower()
         out = dict(load_of(procs, a.get("pane"), a.get("address")) or {})
+        pids = out.pop("_pids", [])
+        if "claude" in prog and not a.get("session"):
+            found = claude_session_of(pids)
+            if found:
+                a["session"] = found
         try:
             speed = opencode_tps(con, a.get("session"), a.get("cwd"), a.get("name"), terminal_info(a.get("address")).get("title")) if con and "opencode" in prog else claude_tps(a["session"]) if "claude" in prog and a.get("session") else None
         except Exception:
             speed = None
         out.update(speed or {})
         session = out.get("session") or a.get("session")
+        if session:
+            out["session"] = session
         try:
             info = info_opencode(con, session) if "opencode" in prog else info_claude(session) if "claude" in prog and session else info_codex(session) if "codex" in prog and session else info_antigravity(session) if re.search("antigravity|agy|gemini", prog) and session else {}
         except Exception:

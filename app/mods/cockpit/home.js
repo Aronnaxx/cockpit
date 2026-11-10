@@ -13,7 +13,7 @@ import { followUsage, AgentLimits } from "./usage.js";
 import { runRecap, recapLabel, SubagentsModel, PerfModel, OmoModel, machineOf, tpsText, localSessions, sessionFor } from "./agentsui.js";
 import { findNode } from "./status.js";
 import * as hub from "./hub.js";
-import { fleet, goToAgent, agentAct, refuseRemoteAgent } from "./fleet.js";
+import { fleet, goToAgent, agentAct } from "./fleet.js";
 import {
   tokens, TEXT, RADIUS, alpha, Icon, Spinner, Badge, Button, Kbd, TextField, Toaster, Flashes, Hover, AlertDialog, openMenu,
   Progress, Mono, dur, Chip, Tabs, CountPill, StageHeading, Metric, Callout, ToneButton, Skeleton, StatTile, Card, Sparkline,
@@ -175,7 +175,7 @@ export default class Home {
     const settled = new Set(spaces().flatMap((s) => s.tabs.filter((t) => t.settled).map((t) => t.id)));
     const branches = new Set(agents.filter((a) => a.branch).map((a) => `${a.repo ?? ""}/${a.branch}`));
     const covered = (pr) => branches.has(`${pr.repo}/${pr.branch}`) || agents.some((a) => a.branch && a.branch === pr.branch);
-    const agentCard = (a) => ({ kind: "agent", key: `a:${a.address}`, stage: a.stage, project: a.repo ?? a.space_name, agent: a, archived: !a.remote && settled.has(a.tab) });
+    const agentCard = (a) => ({ kind: "agent", key: `a:${a.address}`, stage: a.stage, project: a.repo ?? a.space_name, agent: a, archived: settled.has(a.tab) });
     const prCard = (pr, stage) => ({ kind: "pr", key: `p:${pr.url}`, stage, project: pr.repo, pr, agent: agents.find((a) => a.branch && a.branch === pr.branch) ?? null });
     const all = [
       ...agents.map(agentCard),
@@ -293,14 +293,11 @@ export default class Home {
   }
 
   archive(cx, a) {
-    if (refuseRemoteAgent(a)) return;
     run("tab.settle", { id: a.tab });
     this.toasts.push(cx, `Archived ${a.title}`, { kind: "success", description: "Its tab keeps running, folded away.", action: { label: "Undo", onClick: () => run("tab.unsettle", { id: a.tab }) } });
   }
 
   archiveAll(cx, cards) {
-    const remote = cards.find(c => c.agent?.remote);
-    if (remote && refuseRemoteAgent(remote.agent)) return;
     const tabs = [...new Set(cards.filter((c) => c.agent && !c.archived).map((c) => c.agent.tab))];
     for (const id of tabs) run("tab.settle", { id });
     this.toasts.push(cx, `Archived ${plural(tabs.length, "agent")}`, { kind: "success", action: { label: "Undo", onClick: () => tabs.forEach((id) => run("tab.unsettle", { id })) } });
@@ -349,7 +346,7 @@ export default class Home {
   run(action, card, cx) {
     const a = card.agent;
     const pr = card.pr ?? a?.pr;
-    if (action === "go" && a) goToAgent(a);
+    if (action === "go" && a) goToAgent(a.address);
     else if (action === "go" && pr?.url) this.openUrl(cx, pr.url);
     else if (action === "beside" && a) this.openBeside(cx, a);
     else if (action === "recap" && a)
@@ -695,7 +692,7 @@ export default class Home {
       .w_full()
       .gap(12)
       .flex_wrap()
-      .child(tile("kpi-agents", { label: "Agents", icon: "bot", value: needs ? `${needs} need you` : String(cols.working.length + cols.needs.length + cols.done.length), hint: `${cols.working.length} working · ${cols.done.length} done`, onClick: () => needs && goToAgent(cols.needs.find((c) => c.agent).agent) }))
+      .child(tile("kpi-agents", { label: "Agents", icon: "bot", value: needs ? `${needs} need you` : String(cols.working.length + cols.needs.length + cols.done.length), hint: `${cols.working.length} working · ${cols.done.length} done`, onClick: () => needs && goToAgent(cols.needs.find((c) => c.agent).agent.address) }))
       .child(tile("kpi-reviews", { label: "Reviews for you", icon: "eye", value: String(pd ? theirs.filter((p) => p.turn?.who === "you").length : inbox.direct ?? 0), hint: pd ? `${theirs.filter((p) => p.turn?.why === "re-review").length} re-requested · ${theirs.length} open` : `${Math.max(0, (inbox.reviews ?? 0) - (inbox.direct ?? 0))} for your team`, onClick: () => openTab("review", show) }))
       .child(tile("kpi-prs", { label: "Your PRs", icon: "git-pull-request", value: String(pd ? mine.length : prs.length), hint: pd ? `${mine.filter((p) => p.turn?.who === "you").length} on you · ${mine.filter((p) => p.turn?.who === "them").length} waiting` : [ready && `${ready} ready`, fix && `${fix} to fix`].filter(Boolean).join(" · ") || "nothing to do", onClick: () => openTab("mine", show) }))
       .child(tile("kpi-shipped", { label: "Merged this week", icon: "git-merge", value: String(shipped), hint: `${landed.at(-1) ?? 0} today` }))
@@ -764,13 +761,13 @@ export default class Home {
     });
   }
 
-  /** The machines the agents run on: this one's CPU, memory and GPU, other machines' GPUs (perf.remotes), with the last
+  /** The machines the agents run on: this one's CPU, memory and GPU, wyant-dell's GPU (the WyantDell model), with the last
    *  two minutes as sparklines, and the agents' tokens per second right now. */
   machinesCard() {
     const k = tokens();
     const v = this.perf.value;
     const s = v.system ?? {};
-    const remotes = Object.entries(v.remote ?? {}).filter(([, r]) => !r.away);
+    const dell = v.remote?.["wyant-dell"];
     const tps = this.perf.liveTps(this.now);
     const tone = (p) => (p >= 90 ? k.destructive : p >= 70 ? k.warning : k.success);
     const row = (id, label, p, history, detail) =>
@@ -794,10 +791,8 @@ export default class Home {
         row("m-cpu", "Mac CPU", s.cpu, this.perf.history.cpu, `${s.cores ?? "?"} cores`),
         s.mem_total ? row("m-mem", "Mac memory", (s.mem_used / s.mem_total) * 100, null, `${gb(s.mem_used)} of ${gb(s.mem_total)}`) : null,
         row("m-gpu", "Mac GPU", s.gpu, this.perf.history.gpu, "Apple GPU, busy %"),
-        ...remotes.flatMap(([name, r]) => [
-          row(`m-${name}`, `${name} GPU`, r.gpu, this.perf.remoteGpu.get(name), `${r.name ?? "GPU"} on ${name}${r.stale ? " · away, last answer" : ""}`),
-          r.vram_total ? row(`m-${name}-vram`, `${name} VRAM`, (r.vram_used / r.vram_total) * 100, null, `${gb(r.vram_used)} of ${gb(r.vram_total)}`) : null,
-        ]),
+        dell && !dell.away ? row("m-dell", "Dell GPU", dell.gpu, this.perf.history.dell, `${dell.name ?? "GPU"} on wyant-dell (WyantDell) · VRAM ${gb(dell.vram_used ?? 0)} of ${gb(dell.vram_total ?? 0)}${dell.stale ? " · the Dell is away, last answer" : ""}`) : null,
+        dell?.vram_total ? row("m-vram", "Dell VRAM", (dell.vram_used / dell.vram_total) * 100, null, `${gb(dell.vram_used)} of ${gb(dell.vram_total)}`) : null,
       ].filter(Boolean),
     });
   }
@@ -936,7 +931,7 @@ export default class Home {
         actions: [
           !replying && Button("next-reply", { label: narrow ? null : "Reply", icon: "message", variant: "outline", size: narrow ? "icon-sm" : "sm", kbd: narrow ? null : "t", tooltip: "Type an answer here  t", onClick: (_e, cx) => this.startReply(cx, a) }),
           Button("next-beside", { label: narrow ? null : "Open beside", icon: "panel-right", variant: "outline", size: narrow ? "icon-sm" : "sm", tooltip: "Its terminal beside the board  f", onClick: (_e, cx) => this.openBeside(cx, a) }),
-          ToneButton("next-go", { label: "Go to agent", tone: k.blocked, kbd: "⏎", onClick: () => goToAgent(a) }),
+          ToneButton("next-go", { label: "Go to agent", tone: k.blocked, kbd: "⏎", onClick: () => goToAgent(a.address) }),
         ].filter(Boolean),
       });
     }
@@ -1118,7 +1113,7 @@ export default class Home {
     if (info.sandbox) modelChips.push(Chip(`${info.sandbox}${info.approval ? ` · approvals ${info.approval}` : ""}`, { id: `${card.key}-sandbox`, tooltip: "Sandbox and approval policy" }));
     if (info.cost) modelChips.push(Mono(money(info.cost)));
     facts.push(...modelChips);
-    // What its processes cost the machine (herdr/helpers/cockpit-perf.py): a hot one shows in warning, a runaway in red.
+    // What its processes cost the machine (bin/cockpit-perf.py): a hot one shows in warning, a runaway in red.
     const load = a ? this.perf.of(a.address) : null;
     if (load?.cpu != null) {
       const hot = load.cpu >= 150 ? k.destructive : load.cpu >= 60 ? k.warning : k.mutedFg;
@@ -1182,22 +1177,22 @@ export default class Home {
     if (busy) actions.push(h_flex().h(28).gap(6).items_center().child(Spinner({ size: 12, color: tone })).child(div().text_size(TEXT.sm).text_color(k.mutedFg).child(busy)));
     else if (card.stage === "needs" && isAgentCard && a.status !== "blocked") {
       actions.push(ToneButton(`${card.key}-fix`, { label: "Ask it to fix", tone, onClick: (_e, cx) => this.answer(cx, a, { text: a.ci === "FAILURE" ? "The PR's checks fail: look at the failing jobs and fix them." : "Changes were requested on the PR: read the review comments and address them." }) }));
-      actions.push(Button(`${card.key}-go`, { label: "Go to agent", variant: "outline", size: "sm", onClick: () => goToAgent(a) }));
+      actions.push(Button(`${card.key}-go`, { label: "Go to agent", variant: "outline", size: "sm", onClick: () => goToAgent(a.address) }));
       if (pr?.url) actions.push(Button(`${card.key}-open`, { label: "Open PR", variant: "ghost", size: "sm", onClick: (_e, cx) => this.openUrl(cx, pr.url) }));
     } else if (card.stage === "needs" && isAgentCard) {
       if (!a.question?.choices?.length) actions.push(ToneButton(`${card.key}-reply`, { label: "Reply", tone, kbd: "t", onClick: (_e, cx) => this.startReply(cx, a) }));
       actions.push(Button(`${card.key}-beside`, { label: "Open beside", variant: "outline", size: "sm", onClick: (_e, cx) => this.openBeside(cx, a) }));
-      actions.push(Button(`${card.key}-go`, { label: "Go to agent", variant: "ghost", size: "sm", onClick: () => goToAgent(a) }));
+      actions.push(Button(`${card.key}-go`, { label: "Go to agent", variant: "ghost", size: "sm", onClick: () => goToAgent(a.address) }));
     } else if (card.stage === "fix") {
       actions.push(ToneButton(`${card.key}-fix`, { label: `Fix with ${this.home?.agent?.name ?? "the agent"}`, tone: k.destructive, onClick: (_e, cx) => cx.spawn(async (cx) => this.act(cx, card.key, "Starting…", () => hub.act("inbox", "fix_ci", [pr.url]))) }));
       actions.push(Button(`${card.key}-open`, { label: "Open PR", variant: "outline", size: "sm", onClick: (_e, cx) => this.openUrl(cx, pr.url) }));
     } else if (card.stage === "ready" || card.stage === "land") {
       if (pr?.url) actions.push(ToneButton(`${card.key}-merge`, { label: "Merge", tone: k.success, kbd: "m", onClick: (_e, cx) => this.merge(cx, pr) }));
       if (pr?.url) actions.push(Button(`${card.key}-open`, { label: "Open PR", variant: "outline", size: "sm", onClick: (_e, cx) => this.openUrl(cx, pr.url) }));
-      if (a) actions.push(Button(`${card.key}-go`, { label: "Go to agent", variant: "ghost", size: "sm", onClick: () => goToAgent(a) }));
+      if (a) actions.push(Button(`${card.key}-go`, { label: "Go to agent", variant: "ghost", size: "sm", onClick: () => goToAgent(a.address) }));
     } else if (isAgentCard) {
       // Always drawn, so a card never changes size when it is pointed at or picked.
-      actions.push(Button(`${card.key}-go`, { label: "Go to agent", variant: "outline", size: "sm", onClick: () => goToAgent(a) }));
+      actions.push(Button(`${card.key}-go`, { label: "Go to agent", variant: "outline", size: "sm", onClick: () => goToAgent(a.address) }));
       const review = reviewOf(a.tab_name ?? a.title);
       if (review) actions.push(Button(`${card.key}-review`, { label: /^(review|rereview)/.test(a.tab_name ?? a.title) ? "Go to review" : "Go to PR", icon: "git-pull-request", variant: "outline", size: "sm", onClick: () => openDetails(review, show) }));
       actions.push(Button(`${card.key}-recap`, { label: "Recap", icon: "sparkles", variant: "ghost", size: "sm", kbd: "r", tooltip: `Recap with ${recapLabel()}`, onClick: (_e, cx) => this.run("recap", card, cx) }));
@@ -1220,8 +1215,10 @@ export default class Home {
           .gap(6)
           .items_center()
           .child(this.programIcon(a))
+          // Where it runs: another machine's name (none: this computer), then its branch and, when it differs, its space.
+          .when(Boolean(machineOf(a?.address)), (e) => e.child(Chip(machineOf(a.address), { color: k.t.ansi6, icon: "server", id: `${card.key}-machine`, tooltip: `Runs on ${machineOf(a.address)}${a.space_name ? `, in its space “${a.space_name}”` : ""}` })))
           .when(Boolean(card.project), (e) => e.child(Chip(card.project, { color: k.t.ansi4 })))
-          .child(div().flex_1().min_w(0).truncate().font_family("JetBrains Mono").text_size(TEXT.xs).text_color(k.dim).child(a?.branch ?? pr?.branch ?? a?.space_name ?? ""))
+          .child(div().flex_1().min_w(0).truncate().font_family("JetBrains Mono").text_size(TEXT.xs).text_color(k.dim).child([a?.branch ?? pr?.branch, a?.space_name && a.space_name !== card.project ? `${a?.branch ?? pr?.branch ? "in " : ""}${a.space_name}` : null].filter(Boolean).join(" · ")))
           .child(Mono(timer, { color: card.stage === "needs" ? tone : card.stage === "ready" ? k.success : k.mutedFg })),
       )
       .child(div().w_full().truncate().text_size(13.5).font_medium().text_color(k.foreground).child(title))
