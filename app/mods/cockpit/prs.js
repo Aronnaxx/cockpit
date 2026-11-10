@@ -12,6 +12,7 @@ import { loadPrs, prs, prsConfig, ago } from "./prsdata.js";
 import { urgent, urgency, reviewOf } from "./prcards.js";
 import { ModelPicker } from "./modelpick.js";
 import { openSettings } from "./settings.js";
+import { quizChip, gateFor } from "./quizinfo.js";
 import { Drafts } from "./prreview.js";
 import { PrFiles, parsePatch } from "./prfiles.js";
 import { installedEditors, openInEditor } from "./editors.js";
@@ -74,6 +75,9 @@ export default class Prs {
     // The model that explains a pull request and why a comment was made: any of the gateway's, remembered.
     this.explainModel = new ModelPicker(cx, { placeholder: "Search the gateway's models", store: "cockpit.explain.model" });
     this.drafts.modelOf = () => this.explainModel.value();
+    // Posting waits for a passed quiz when quiz.gate is on; the way there is Quiz me.
+    this.drafts.gateOf = (p) => gateFor(keyOf(p));
+    this.drafts.toQuiz = (p, cx) => { this.view = "quiz"; this.loadQuiz(cx, p); cx.notify(); };
     this.jobs = new Map(); // "explain:<key>" | "quiz:<key>" -> {kind, p, model, at}: running in the background
     cx.timer.every(3000, (cx) => this.pollJobs(cx));
     // A pending review kept in sync: GitHub's side checked for edits made there (VS Code, the PR page).
@@ -82,6 +86,9 @@ export default class Prs {
       if (p && this.drafts.sync.get(keyOf(p))?.on && !this.drafts.sync.get(keyOf(p))?.busy) this.drafts.pending(cx, p, "status");
     });
     cx.timer.every(30000, (cx) => this.autoJobs(cx));
+    // Threads that wait on you: what their replies say and the responses drafted (bin/cockpit-explain.py reply), by thread.
+    this.replies = new Map();
+    this.replyBusy = new Set();
     this.quiz = new Map(); // key -> the quiz (bin/cockpit-explain.py quiz) with your answers | "loading" | {error}
     this.explain = new Map(); // key -> the explanation (bin/cockpit-explain.py) | "loading" | {error}
     // The review drafts on disk (what "In progress" lists with the agents working on a PR): key -> {comments, verdict}.
@@ -160,6 +167,26 @@ export default class Prs {
           this.draftInfo = next;
           cx.notify();
         }
+        // Each quiz's score, and the gate, for every view (quizinfo.js): the PR list, Home's cards, the Post button.
+        if (this.docked) return;
+        this.cfg = await prsConfig();
+        const qdir = `${home}/.cache/cockpit/quiz`;
+        const out = {};
+        for (const name of (await exec("ls", [qdir]).catch(() => ({ stdout: "" }))).stdout.split("\n")) {
+          const m = name.match(/^(.+?)__(.+)__(\d+)\.json$/);
+          if (!m) continue;
+          try {
+            const d = JSON.parse((await readTextFile(`${qdir}/${name}`)) ?? "{}");
+            const key = `${m[1]}/${m[2]}#${m[3]}`;
+            const total = (d.questions ?? []).length;
+            const answers = d.answers ?? {};
+            const pr = this.list().find((x) => keyOf(x) === key);
+            if (total) out[key] = { total, answered: Object.keys(answers).length, right: (d.questions ?? []).filter((q, i) => answers[i] === q.answer).length, stale: Boolean(pr && d.head && pr.head && d.head !== pr.head) };
+          } catch {}
+        }
+        for (const key of next.keys()) out[key] = { ...(out[key] ?? {}), draft: true };
+        const value = { gate: { on: this.cfg?.quiz?.gate === true, pass: Number(this.cfg?.quiz?.pass ?? 75) }, prs: out };
+        if (JSON.stringify(shared("cockpit.quiz") ?? null) !== JSON.stringify(value)) setShared("cockpit.quiz", value);
       } catch {}
     });
   }
@@ -295,6 +322,7 @@ export default class Prs {
     if (!this.convo.has(keyOf(p))) this.readConvo(cx, p);
     this.drafts.load(cx, p).then((c) => c && cx.notify());
     this.loadQuiz(cx, p);
+    this.loadReplies(cx, p);
     this.autoJobs(cx, p);
     this.drafts.pending(cx, p, "status");
     if (p.role === "author" && (p.behind ?? 0) > 0) this.checkMerge(cx, p);
@@ -568,7 +596,7 @@ export default class Prs {
           .flex_1()
           .min_w(0)
           .gap(3)
-          .child(h_flex().gap(8).items_center().child(div().truncate().font_semibold().text_size(TEXT.base).text_color(k.foreground).child(p.title)).when(Boolean(this.pill(k, p)), (e) => e.child(this.pill(k, p))).when(p.draft, (e) => e.child(Badge("draft", "secondary"))).when(Boolean(working?.length), (e) => e.child(chip(working.some((a) => a.status === "working") ? "AGENT WORKING" : "AGENT DONE", k.info))).when(Boolean(draft), (e) => e.child(chip(`REVIEW DRAFT · ${draft.comments}`, k.warning))))
+          .child(h_flex().gap(8).items_center().child(div().truncate().font_semibold().text_size(TEXT.base).text_color(k.foreground).child(p.title)).when(Boolean(this.pill(k, p)), (e) => e.child(this.pill(k, p))).when(p.draft, (e) => e.child(Badge("draft", "secondary"))).when(Boolean(working?.length), (e) => e.child(chip(working.some((a) => a.status === "working") ? "AGENT WORKING" : "AGENT DONE", k.info))).when(Boolean(draft), (e) => e.child(chip(`REVIEW DRAFT · ${draft.comments}`, k.warning))).when(Boolean(quizChip(keyOf(p), Boolean(draft))), (e) => { const q = quizChip(keyOf(p), Boolean(draft)); return e.child(div().id(`pr-quiz-${keyOf(p)}`).tooltip(q.tooltip).child(chip(q.label, q.tone === "muted" ? k.mutedFg : k[q.tone]))); }))
           .child(
             h_flex()
               .gap(8)
@@ -710,11 +738,20 @@ export default class Prs {
       });
       return;
     }
+    // Fisher-Yates: the questions in a new order, and each one's choices.
+    const shuffle = (a) => {
+      for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    };
     for (const q of d.questions) {
-      const order = q.choices.map((_, i) => i).sort(() => Math.random() - 0.5);
+      const order = shuffle(q.choices.map((_, i) => i));
       q.answer = order.indexOf(q.answer);
       q.choices = order.map((i) => q.choices[i]);
     }
+    shuffle(d.questions);
     d.answers = {};
     cx.notify();
     cx.spawn(async () => {
@@ -734,11 +771,13 @@ export default class Prs {
     if (!d?.questions || d.answers?.[qi] != null) return;
     d.answers = { ...(d.answers ?? {}), [qi]: choice };
     cx.notify();
-    cx.spawn(async () => {
+    cx.spawn(async (cx) => {
       const { home } = await hub.install();
       const file = `${home}/.cache/cockpit/quiz/${p.repo.replace("/", "__")}__${p.number}.json`;
       const cur = await readTextFile(file).catch(() => null);
       await writeTextFile(file, JSON.stringify(d), cur).catch(() => {});
+      // The score is shared at once (the list's chip, the Post button's gate).
+      this.readDrafts(cx);
     });
   }
 
@@ -809,6 +848,94 @@ export default class Prs {
               .child(Button("prs-quiz-back", { label: "Back to the review", size: "sm", variant: done ? "default" : "ghost", onClick: (_e, cx) => ((this.view = null), cx.notify()) }))),
         );
       })
+  }
+
+  /** The threads that wait on you: unresolved, someone else wrote last, and you are in them (or it is your own PR). */
+  waiting(p) {
+    const c = this.convo.get(keyOf(p));
+    const me = prs()?.me;
+    if (!c || c === "loading" || !me) return [];
+    return (c.items ?? []).filter((t) => t.kind === "thread" && !t.resolved && t.reply_id && t.comments?.length && t.comments.at(-1).author !== me && (p.role === "author" || t.comments.some((x) => x.author === me)));
+  }
+
+  /** Explanations and drafted responses written earlier, by thread (bin/cockpit-explain.py reply). */
+  loadReplies(cx, p) {
+    if (this.replies.has(keyOf(p))) return;
+    this.replies.set(keyOf(p), {});
+    cx.spawn(async (cx) => {
+      const { home } = await hub.install();
+      const text = await readTextFile(`${home}/.cache/cockpit/replies/${p.repo.replace("/", "__")}__${p.number}.json`).catch(() => null);
+      try {
+        if (text) this.replies.set(keyOf(p), JSON.parse(text));
+      } catch {}
+      cx.notify();
+    });
+  }
+
+  /** Explains the latest reply on a thread and drafts your response, which goes into the review draft (edited and posted there). */
+  answerThread(cx, p, t) {
+    const id = String(t.reply_id);
+    if (this.replyBusy.has(id)) return;
+    this.replyBusy.add(id);
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const { home } = await hub.install();
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-explain.py`, "reply", p.repo, String(p.number), id, this.jobModel()], { timeout: 300000 });
+        const d = JSON.parse(r.stdout || "{}");
+        if (d.error) notify({ title: "No explanation", body: d.error });
+        else {
+          this.replies.set(keyOf(p), { ...(this.replies.get(keyOf(p)) ?? {}), [id]: d });
+          const e = this.drafts.m.get(keyOf(p));
+          const already = (e?.rows ?? []).some((row) => String(row.reply_to) === id);
+          if (!already && d.reply) this.drafts.addComment(cx, p, { reply_to: t.reply_id, quote: `${t.path}:${t.line ?? ""} · ${t.comments.at(-1).author}: ${String(t.comments.at(-1).body).slice(0, 80)}`, body: d.reply, why: d.why });
+        }
+      } catch (err) {
+        notify({ title: "No explanation", body: String(err?.message ?? err).slice(0, 160) });
+      }
+      this.replyBusy.delete(id);
+      cx.notify();
+    });
+  }
+
+  repliesSection(k, p) {
+    const list = this.waiting(p);
+    if (!list.length) return null;
+    const done = this.replies.get(keyOf(p)) ?? {};
+    const e = this.drafts.m.get(keyOf(p));
+    const STANCE = { agrees: ["agrees", k.success], fixed: ["says it's fixed", k.success], disagrees: ["disagrees", k.destructive], asks: ["asks you something", k.warning], explains: ["explains", k.info], other: ["replied", k.mutedFg] };
+    const todo = list.filter((t) => !done[String(t.reply_id)] && !this.replyBusy.has(String(t.reply_id)));
+    return v_flex().gap(8)
+      .child(h_flex().gap(8).items_center()
+        .child(div().text_size(TEXT.sm).font_semibold().text_color(k.foreground).child(`Waiting on your reply · ${list.length}`))
+        .child(div().flex_1())
+        .when(todo.length > 1, (x) => x.child(Button("prs-replies-all", { label: `Explain and draft all · ${todo.length}`, icon: "sparkles", size: "sm", variant: "outline", tooltip: `Each with ${this.jobModel()}; the responses go into your review draft`, onClick: (_e, cx) => todo.forEach((t) => this.answerThread(cx, p, t)) }))))
+      .children(list.map((t, i) => {
+        const id = String(t.reply_id);
+        const last = t.comments.at(-1);
+        const res = done[id];
+        const fresh = res && (!res.last_at || res.last_at === last.at);
+        const busy = this.replyBusy.has(id);
+        const inDraft = (e?.rows ?? []).some((row) => String(row.reply_to) === id && row.body.value().trim());
+        const [stance, tone] = STANCE[res?.stance] ?? STANCE.other;
+        const earlier = t.comments.slice(0, -1);
+        return v_flex().id(`rp-${id}`).gap(8).p(12).rounded(RADIUS.md).border_1().border_color(alpha(k.warning, 0.45)).bg(k.card)
+          .child(h_flex().gap(8).items_center()
+            .child(Mono(`${t.path}${t.line ? `:${t.line}` : ""}`, { size: TEXT.xs, color: k.foreground }))
+            .when(t.outdated, (x) => x.child(Badge("outdated", "warning")))
+            .child(div().flex_1())
+            .when(Boolean(res) && fresh, (x) => x.child(div().px(6).h(16).flex().items_center().rounded(4).text_size(10).bg(alpha(tone, 0.14)).text_color(tone).child(`${last.author} ${stance}`)))
+            .when(inDraft, (x) => x.child(Badge("reply in your draft", "info"))))
+          .children(earlier.length ? [div().text_size(TEXT.xs).text_color(k.dim).truncate().child(`${earlier.map((c) => c.author).join(" → ")}: ${String(earlier.at(-1).body).replace(/\s+/g, " ").slice(0, 140)}`)] : [])
+          .child(v_flex().gap(2).pl(10).border_l_2().border_color(k.border)
+            .child(div().text_size(TEXT.xs).text_color(k.mutedFg).child(`${last.author} · ${ago(last.at)} ago`))
+            .child(TextView.markdown(`rp-md-${id}`, String(last.body).length > 900 ? `${String(last.body).slice(0, 900)}…` : String(last.body)).selectable(true).w_full()))
+          .when(Boolean(res) && fresh, (x) => x.child(v_flex().gap(4).p(10).rounded(RADIUS.sm).border_l_2().border_color(k.info).bg(alpha(k.info, 0.06)).child(div().text_size(TEXT.xs).font_semibold().text_color(k.info).child(`What it says · ${res.model}`)).child(TextView.markdown(`rp-x-${id}`, res.explain ?? "").selectable(true).w_full())))
+          .child(h_flex().gap(8).items_center()
+            .child(Button(`rp-go-${id}`, { label: busy ? "Reading the thread…" : res && fresh ? "Explain and draft again" : "Explain and draft a reply", icon: "sparkles", size: "sm", variant: res && fresh ? "ghost" : "outline", disabled: busy, tooltip: "What their reply says and whether it settles it, and your response drafted in your voice: it goes into the review draft to edit and post", onClick: (_e, cx) => this.answerThread(cx, p, t) }))
+            .when(busy, (x) => x.child(Spinner({ size: 12 })))
+            .when(Boolean(t.url), (x) => x.child(Button(`rp-gh-${id}`, { label: "On GitHub", icon: "external", size: "sm", variant: "ghost", onClick: (_e, cx) => cx.spawn(async () => hub.openUrl(t.url)) }))));
+      }));
   }
 
   detail(k, p, cx) {
@@ -888,6 +1015,7 @@ export default class Prs {
         ),
       )
       .child(this.drafts.section(k, p, { agentButton: Button("rv-agent", { label: p.role === "author" ? "Draft replies with an agent…" : "Draft a review with an agent…", icon: "bot", size: "sm", variant: "outline", tooltip: "An agent reads the PR and writes a draft here. Nothing is posted.", onClick: () => openMenu(LAUNCH_AGENTS.map((a) => ({ label: a.label, icon: "bot", command: `prs:${p.role === "author" ? "fix" : p.turn?.why === "re-review" ? "rereview" : "review"}:${a.id}:${keyOf(p)}` })), { width: 220 }) }) }))
+      .children([this.repliesSection(k, p)].filter(Boolean))
       .child(section(`Conversation`, this.conversation(k, p)))
       .child(
         section(

@@ -3,6 +3,7 @@
 cockpit-explain.py pr <owner/name> <number> <model>
 cockpit-explain.py why <owner/name> <number> <comment index> <model>
 cockpit-explain.py fill <owner/name> <number>
+cockpit-explain.py reply <owner/name> <number> <thread's first comment id> <model>
 cockpit-explain.py quiz <owner/name> <number> <model> [--missed <file of questions answered wrong>]
 Explanations written by a model of the LiteLLM gateway (cockpit_gateway.py); nothing is written to GitHub.
 
@@ -19,6 +20,11 @@ behaves, and whether the draft's comments (the agent's) hold up. Multiple choice
 how many: quiz.difficulty ("basics", "standard", "deep") and quiz.count ("fit": by the size of the change and the draft, or a
 number) in the cockpit config. --missed: new questions on what the person got wrong last time. Kept in
 ~/.cache/cockpit/quiz/<owner>__<name>__<number>.json with the head, and printed.
+
+reply: a review thread someone answered and that waits on you: what their latest reply says (and whether it settles the
+point), and a response drafted in your voice (~/.config/cockpit/voice-pr-review.md when it exists). Kept in
+~/.cache/cockpit/replies/<owner>__<name>__<number>.json by thread; prints {explain, stance, reply, why}. The PR page puts the
+response in the review draft, where it is edited and posted like any reply.
 
 why: why a comment of the review draft (~/.cache/cockpit/review-drafts/...) was made: from the code it is on, the PR's diff of
 that file, and what the agent that wrote the draft said and did while reviewing (its session transcript, found by the draft's
@@ -245,7 +251,7 @@ QUIZ_SYSTEM = """You write a short quiz for an engineer who is about to put thei
 Write exactly {count} questions, multiple choice, four choices each, one right:
 - about half on the change itself ("behaviour": what happens now in a concrete case, before vs after; "design": why it is built this way or what it trades off; "risk": what could break and for whom). Use concrete inputs and situations from the code.
 - the rest on the draft's comments (none if it has none) ("comment", with "comment" set to the comment's index as given): does the comment's claim hold, what in the code makes it so, or what the right fix is. When a comment is wrong or overstated, the right answer says so. Do not leak the answer in the question.
-For other questions "comment" is -1. "answer" is the index (0-3) of the right choice; place it at varying positions. Make the wrong choices plausible to someone who only skimmed. "explain": two or three sentences on why the answer is right, pointing at the code (file and line)."""
+Refer to a comment by its file and line or by what it says ("the comment on line 77 of qRadioEnvironmentTest.sh"), never by its number in brackets: the person sees the comment's code beside the question, not those numbers. For other questions "comment" is -1. "answer" is the index (0-3) of the right choice; place it at varying positions. Make the wrong choices plausible to someone who only skimmed. "explain": two or three sentences on why the answer is right, pointing at the code (file and line)."""
 
 
 LEVELS = {
@@ -303,6 +309,8 @@ def quiz(slug, number, model, missed=None):
         if q.get("about") == "comment" and c:
             q["path"], q["line"], q["start_line"] = c["path"], c.get("line"), c.get("start_line")
         qs.append(q)
+    # The questions in no set order either: on the change and on the comments mixed.
+    random.shuffle(qs)
     out = {"questions": qs, "model": model, "head": meta["headRefOid"], "at": int(time.time() * 1000), "difficulty": level, "count": count, "focus": bool(missed)}
     folder = os.path.expanduser("~/.cache/cockpit/quiz")
     os.makedirs(folder, exist_ok=True)
@@ -334,6 +342,61 @@ def marked(kind, slug, number, model, fn):
             os.remove(name + ".running")
 
 
+REPLY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["explain", "stance", "reply", "why"],
+    "properties": {
+        "explain": {"type": "string"},
+        "stance": {"enum": ["agrees", "disagrees", "fixed", "asks", "explains", "other"]},
+        "reply": {"type": "string"},
+        "why": {"type": "string"},
+    },
+}
+
+
+def reply(slug, number, reply_id, model):
+    here = os.path.dirname(os.path.abspath(__file__))
+    r = subprocess.run([sys.executable, os.path.join(here, "cockpit-pr-comments.py"), slug, str(number)], capture_output=True, text=True, timeout=120)
+    items = json.loads(r.stdout or "{}").get("items") or []
+    t = next((i for i in items if i.get("kind") == "thread" and str(i.get("reply_id")) == str(reply_id)), None)
+    if not t:
+        raise RuntimeError("that thread is not on the pull request any more")
+    me = gh("api", "user", "--jq", ".login").strip()
+    title = json.loads(gh("pr", "view", str(number), "-R", slug, "--json", "title"))["title"]
+    code = ""
+    if t.get("path") and t.get("line"):
+        f = subprocess.run([sys.executable, os.path.join(here, "cockpit-pr-file.py"), slug, str(number), t["path"]], capture_output=True, text=True, timeout=90)
+        lines = (json.loads(f.stdout or "{}").get("files") or {}).get(t["path"]) or []
+        lo, hi = max(1, int(t["line"]) - 15), int(t["line"]) + 15
+        code = "\n".join(f"{i:5} {lines[i - 1]}" for i in range(lo, min(hi, len(lines)) + 1))
+    voice_path = os.path.expanduser("~/.config/cockpit/voice-pr-review.md")
+    voice = open(voice_path, encoding="utf-8").read() if os.path.exists(voice_path) else "Short and plain; ask rather than dictate; backticks for code."
+    thread = "\n\n".join(f"{'YOU (' + me + ')' if c['author'] == me else c['author']}: {c['body']}" for c in t["comments"])
+    system = (f"You help {me} answer a code review thread on a pull request. The thread waits on them: someone else wrote last. "
+              "explain: markdown, short: what the latest reply says in plain words, whether it settles the original point or not (and why, from the code), and what it asks of them, if anything. "
+              "stance: how that reply stands to the point (agrees, disagrees, fixed, asks, explains, other). "
+              "reply: the response they would post, in their voice as described below, ready to edit: agree and close it when the point is settled, ask the one question that matters when it is not, never argue for its own sake, no praise padding. "
+              "why: one or two sentences on why that response. Never invent what the code does; say when the code shown does not decide it.\n\nTheir voice:\n" + voice +
+              "\n\nAnswer with one JSON object following this schema:\n" + json.dumps(REPLY_SCHEMA))
+    prompt = f"Pull request {slug}#{number}: {title}\nThe thread is on {t.get('path')} line {t.get('line')}{' (outdated)' if t.get('outdated') else ''}.\n\nThe diff there:\n{t.get('hunk') or ''}\n\n" + (f"The code at the PR's head:\n{code}\n\n" if code else "") + f"The thread, oldest first:\n{thread}"
+    text, _ = cockpit_gateway.ask(model, [{"role": "system", "content": system}, {"role": "user", "content": prompt}], max_tokens=6000, schema=REPLY_SCHEMA)
+    d = cockpit_gateway.as_json(text)
+    d.update(model=model, at=int(time.time() * 1000), last_at=(t["comments"][-1] or {}).get("at"))
+    folder = os.path.expanduser("~/.cache/cockpit/replies")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{slug.replace('/', '__')}__{number}.json")
+    try:
+        cache = json.load(open(path))
+    except Exception:
+        cache = {}
+    cache[str(reply_id)] = d
+    with open(path + ".tmp", "w") as f:
+        json.dump(cache, f)
+    os.replace(path + ".tmp", path)
+    return d
+
+
 def main():
     a = sys.argv[1:]
     try:
@@ -344,6 +407,8 @@ def main():
         elif len(a) >= 4 and a[0] == "quiz":
             missed = json.load(open(a[a.index("--missed") + 1])) if "--missed" in a else None
             print(json.dumps(marked("quiz", a[1], a[2], a[3], lambda: quiz(a[1], a[2], a[3], missed))))
+        elif len(a) >= 5 and a[0] == "reply":
+            print(json.dumps(reply(a[1], a[2], a[3], a[4])))
         elif len(a) >= 5 and a[0] == "why":
             print(json.dumps(explain_why(a[1], a[2], a[3], a[4])))
         else:

@@ -32,7 +32,7 @@ const SECTIONS = [
 export default class Settings {
   init(_p, cx) {
     this.section = props()?.section ?? _p?.section ?? "layout";
-    this.ai = { auto: true, autoQuiz: true, difficulty: "standard", count: "fit" };
+    this.ai = { auto: true, autoQuiz: true, difficulty: "standard", count: "fit", gate: false, pass: 75 };
     // The model that explains and quizzes: any of the gateway's, saved as explain.model when picked.
     this.explainModel = new ModelPicker(cx, { placeholder: "Search the gateway's models", onPick: (m, cx) => this.save(cx, (cfg) => ({ ...cfg, explain: { ...(cfg.explain ?? {}), model: m } })) });
     this.slotsUrl = InputState.new({ placeholder: "http://127.0.0.1:5555" });
@@ -52,7 +52,7 @@ export default class Settings {
           this.titles = cfg.titles?.enabled !== false;
           this.statusItems = (cfg.statusbar?.items ?? this.statusItems).filter((n) => ["agent", "mode", "usage", "machines", "omo", "tps"].includes(n));
           this.header = (cfg.sidebar?.header ?? this.header).filter((x) => SECTIONS.some(([n]) => n === x));
-          this.ai = { auto: cfg.explain?.auto !== false, autoQuiz: cfg.explain?.auto_quiz !== false, difficulty: cfg.quiz?.difficulty ?? "standard", count: cfg.quiz?.count ?? "fit" };
+          this.ai = { auto: cfg.explain?.auto !== false, autoQuiz: cfg.explain?.auto_quiz !== false, difficulty: cfg.quiz?.difficulty ?? "standard", count: cfg.quiz?.count ?? "fit", gate: cfg.quiz?.gate === true, pass: Number(cfg.quiz?.pass ?? 75) };
           this.explainModel.input.set_value(cfg.explain?.model ?? "agy/gemini-3.8-flash-medium");
           this.slotsUrl.set_value(cfg.usage?.slots?.url ?? "");
           this.slotsVia.set_value(cfg.usage?.slots?.via ?? "");
@@ -81,7 +81,7 @@ export default class Settings {
 
   setAi(cx, key, value) {
     this.ai = { ...this.ai, [key]: value };
-    const [group, field] = { auto: ["explain", "auto"], autoQuiz: ["explain", "auto_quiz"], difficulty: ["quiz", "difficulty"], count: ["quiz", "count"] }[key];
+    const [group, field] = { auto: ["explain", "auto"], autoQuiz: ["explain", "auto_quiz"], difficulty: ["quiz", "difficulty"], count: ["quiz", "count"], gate: ["quiz", "gate"], pass: ["quiz", "pass"] }[key];
     this.save(cx, (cfg) => ({ ...cfg, [group]: { ...(cfg[group] ?? {}), [field]: value } }));
   }
 
@@ -182,6 +182,8 @@ export default class Settings {
       ]),
       card("settings-quiz", "Quizzes", "How hard and how long a new quiz is; a quiz already written keeps its questions", [
         line("set-quiz-level", "Difficulty", { basics: "What it does and the common case", standard: "Concrete behaviour and why it is built this way", deep: "Edge cases, failure modes, ordering, callers: the code itself" }[this.ai.difficulty] ?? "", Tabs("set-quiz-level-t", { value: this.ai.difficulty, onChange: (v, cx) => this.setAi(cx, "difficulty", v), items: [{ value: "basics", label: "Basics" }, { value: "standard", label: "Standard" }, { value: "deep", label: "Deep" }] })),
+        line("set-quiz-gate", "Pass the quiz before posting", this.ai.gate ? `Post review waits until you have answered every question and got at least ${this.ai.pass}% right. (Submitting the pending review on GitHub yourself still bypasses it.)` : "Off: the quiz is there to take, posting does not wait for it", Toggle("set-quiz-gate-t", this.ai.gate, (cx) => this.setAi(cx, "gate", !this.ai.gate))),
+        this.ai.gate ? line("set-quiz-pass", "Pass mark", `${this.ai.pass}% of the questions right`, Tabs("set-quiz-pass-t", { value: String(this.ai.pass), onChange: (v, cx) => this.setAi(cx, "pass", Number(v)), items: [50, 60, 75, 90, 100].map((n) => ({ value: String(n), label: `${n}%` })) })) : null,
         line("set-quiz-count", "Questions", this.ai.count === "fit" ? "Fitted to the pull request: more for a bigger change and more agent comments (4 to 14)" : `Always ${this.ai.count}`, Tabs("set-quiz-count-t", { value: String(this.ai.count), onChange: (v, cx) => this.setAi(cx, "count", v === "fit" ? "fit" : Number(v)), items: [{ value: "fit", label: "Fit" }, ...[4, 6, 8, 10, 12].map((n) => ({ value: String(n), label: String(n) }))] })),
       ]),
       card("settings-titles", "Agent tabs", "An unnamed agent tab gets a few words for its task; a name you typed is never touched", [

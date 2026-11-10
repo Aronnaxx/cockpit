@@ -6,7 +6,7 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState, TextareaState, Textarea, Input, TextView } from "gpui-base";
 import { exec, notify, readTextFile, writeTextFile } from "herdr";
 import * as hub from "./hub.js";
-import { tokens, alpha, TEXT, RADIUS, Badge, Button, Tabs, Mono, Spinner, Toggle } from "./ui.js";
+import { tokens, alpha, TEXT, RADIUS, Badge, Button, Tabs, Mono, Spinner, Toggle, Icon } from "./ui.js";
 import { CodeRows } from "./codeblock.js";
 
 const keyOf = (p) => `${p.repo}#${p.number}`;
@@ -35,6 +35,9 @@ export class Drafts {
     this.whyBusy = new Set();
     // The gateway model that explains (set by the page).
     this.modelOf = () => "";
+    // Whether posting may go ahead ({ok, why}: a passed quiz when quiz.gate is on), and the way to the quiz; set by the page.
+    this.gateOf = () => ({ ok: true });
+    this.toQuiz = null;
     // Kept in sync with your pending review on GitHub (bin/cockpit-pr-pending.py): key -> {on, busy, at, error, conflict, exists}.
     this.sync = new Map();
   }
@@ -316,6 +319,8 @@ export class Drafts {
         else if (d.pending !== undefined) notify({ title: "Kept as a pending review on GitHub", body: `${keyOf(p)}: ${d.pending} comment${d.pending === 1 ? "" : "s"}. Only you see it; open it in VS Code's pull request view and submit it there, or keep editing here.` });
         else {
           notify({ title: "Review posted", body: `${keyOf(p)}: ${d.posted} comment${d.posted === 1 ? "" : "s"}, ${d.replies} repl${d.replies === 1 ? "y" : "ies"}` });
+          // The inbox and the PR list read it again: it is no longer on you.
+          hub.request("act", { app: "inbox", action: "request_refresh", args: [] }).catch(() => {});
           this.m.set(keyOf(p), { raw: null, exists: false });
           this.preview.delete(keyOf(p));
           this.sync.delete(keyOf(p));
@@ -372,12 +377,14 @@ export class Drafts {
     const tone = e.verdict === "APPROVE" ? k.success : e.verdict === "REQUEST_CHANGES" ? k.destructive : k.mutedFg;
     const frame = (...kids) => v_flex().gap(10).p(14).rounded(RADIUS.lg).border_1().border_color(e.exists ? alpha(k.info, 0.5) : k.border).bg(e.exists ? alpha(k.info, 0.04) : k.card).children(kids.filter(Boolean));
     const head = (extra = []) => h_flex().gap(8).items_center().child(div().text_size(TEXT.base).font_semibold().child("Your review")).when(e.exists, (x) => x.child(Badge("draft", "secondary"))).child(div().flex_1()).children(extra.filter(Boolean));
+    const gate = this.gateOf(p);
     const setVerdict = (v, cx) => { e.verdict = v; this.begin(cx, e); cx.notify(); };
     const actions = h_flex().gap(8).items_center().children([
       e.exists ? Button("rv-preview", { label: showPreview ? "Back to editing" : "Preview", icon: showPreview ? "pencil" : "eye", size: "sm", variant: "ghost", onClick: (_e, cx) => { showPreview ? this.preview.delete(keyOf(p)) : this.preview.add(keyOf(p)); cx.notify(); } }) : null,
       e.exists ? Button("rv-discard", { label: "Discard", size: "sm", variant: "ghost", onClick: (_e, cx) => this.discard(cx, p) }) : null,
       Button("rv-save", { label: "Save draft", size: "sm", variant: "outline", disabled: empty, onClick: (_e, cx) => { e.chain = e.chain.then(() => this.save(e)).catch(() => {}); notify({ title: "Draft saved", body: `${keyOf(p)} · it stays here until you post it` }); cx.notify(); } }),
-      Button("rv-post", { label: this.busy === keyOf(p) ? "Posting…" : "Post review…", size: "sm", disabled: this.busy === keyOf(p) || empty, onClick: (_e, cx) => ((this.confirm = { p }), cx.notify()) }),
+      !gate.ok && this.toQuiz ? Button("rv-to-quiz", { label: "Take the quiz", icon: "circle-help", size: "sm", variant: "outline", tooltip: gate.why, onClick: (_e, cx) => this.toQuiz(p, cx) }) : null,
+      Button("rv-post", { label: this.busy === keyOf(p) ? "Posting…" : "Post review…", size: "sm", disabled: this.busy === keyOf(p) || empty || !gate.ok, tooltip: gate.ok ? undefined : gate.why, onClick: (_e, cx) => ((this.confirm = { p }), cx.notify()) }),
     ].filter(Boolean));
     const syncRow = this.syncRow(k, p, e);
     if (showPreview) {
@@ -426,6 +433,7 @@ export class Drafts {
           .children([this.whyPanel(k, p, r)].filter(Boolean)),
       ),
       syncRow,
+      !gate.ok ? h_flex().gap(6).items_center().child(Icon("circle-help", { size: 13, color: k.warning })).child(div().text_size(TEXT.xs).text_color(k.warning).child(gate.why)) : null,
       h_flex().gap(8).items_center().child(Button("rv-add", { label: "Add a line comment", icon: "plus", size: "sm", variant: "ghost", onClick: (_e, cx) => this.addComment(cx, p) })).children([agentButton].filter(Boolean)).child(div().flex_1()).child(Tabs("rv-verdict", { value: e.verdict, onChange: setVerdict, items: VERDICTS.map(([value, label]) => ({ value, label })) })),
       h_flex().justify_end().child(actions),
     );

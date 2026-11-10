@@ -34,7 +34,7 @@ Path: `~/.cache/cockpit/review-drafts/<owner>__<repo>__<number>.json` (the promp
 
 - `verdict`: `COMMENT`, `APPROVE` or `REQUEST_CHANGES`. Use `COMMENT` unless the prompt or the findings clearly call for another.
 - `path` is the file's path in the repo. `line` is the line in the **new** version of the file (the PR's head). For several lines, `start_line` is the first and `line` the last. Comment on the lines the problem is in, not a function's signature far from it.
-- `body` is what gets posted, in the person's voice: short, specific, one point per comment, with a suggested fix when there is an obvious one. No praise padding, no "nit:" pile-ups; fold small nits into one comment.
+- `body` is what gets posted, in the person's voice: **read `~/.config/cockpit/voice-pr-review.md` first when it exists and write every `body`, `summary` and reply the way it says** (its prefixes, its questions over commands, its examples). Without it: short, specific, one point per comment, with a suggested fix when there is an obvious one. No praise padding, no "nit:" pile-ups; fold small nits into one comment. The `why` is for the person and can be plain.
 - **`why` on every line comment** (never posted, it is for the person): two or three sentences on what led you to it, meaning the code paths, callers or tests you read and what you ran, and how sure you are (high, medium or low). Say plainly when you did not run or verify something.
 - `reply_to` is the id of a review thread's first comment (`gh api repos/<owner>/<repo>/pulls/<n>/comments`), for replies only.
 

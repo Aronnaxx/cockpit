@@ -1,6 +1,7 @@
 // Pull requests on Home: yours (whose move it is, approvals, reviewers, CI, behind main) and the ones you are asked to review.
 // Data: prsdata.js. Agents start from here the way they do on the PRs page (agentlaunch.js); nothing is posted to GitHub.
 
+import { quizChip, quizOf } from "./quizinfo.js";
 import { div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { notify, setShared } from "herdr";
@@ -126,6 +127,8 @@ export function PrCard(p, { show, openUrl }) {
         .child(failed ? chip(k, `CI: ${failed} failed`, k.destructive) : p.ci?.state === "pending" || p.ci?.pending ? chip(k, "CI running", k.warning) : chip(k, "CI passing", k.success))
         .when(author && (p.behind ?? 0) > 0, (e) => e.child(chip(k, `${p.behind} behind main`, k.warning)))
         .when((p.unresolved ?? 0) > 0, (e) => e.child(chip(k, `${p.unresolved} unresolved`, k.warning)))
+        // The quiz: not taken (once there is a review draft), under way, passed or not.
+        .when(Boolean(quizChip(prKey(p), Boolean(quizOf(prKey(p))?.draft))), (e) => { const q = quizChip(prKey(p), Boolean(quizOf(prKey(p))?.draft)); return e.child(div().id(`pc-quiz-${prKey(p)}`).tooltip(q.tooltip).child(chip(k, q.label, q.tone === "muted" ? k.mutedFg : k[q.tone]))); })
         .child(chip(k, `active ${ago(p.last_activity)}`, k.mutedFg)),
     )
     .when(reviewers.length > 0, (e) =>
