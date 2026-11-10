@@ -7,6 +7,8 @@ import { div, svg, image } from "gpui-kit";
 import { h_flex, v_flex, InputState } from "gpui-base";
 import { run, spaces, knownAgents, setShared, layout, readTextFile, exec } from "herdr";
 import { show } from "./sidebar.js";
+import { loadPrs, prs, prs as prsData, prsConfig } from "./prsdata.js";
+import { PrSections, startFromHome } from "./prcards.js";
 import { followUsage, AgentLimits } from "./usage.js";
 import { runRecap, recapLabel, SubagentsModel, PerfModel, OmoModel, machineOf, tpsText, localSessions, sessionFor } from "./agentsui.js";
 import { findNode } from "./status.js";
@@ -73,6 +75,10 @@ function greeting(now) {
 
 export default class Home {
   init(_props, cx) {
+    this.prcfg = {};
+    loadPrs();
+    prsConfig().then((c) => (this.prcfg = c));
+    cx.timer.every(60_000, (cx) => { loadPrs().then(() => cx.notify()); });
     this.rows = null;
     this.home = null;
     this.queue = null;
@@ -368,7 +374,8 @@ export default class Home {
     if (c === "show:home" || c === "focus") this.handle.focus();
     else if (c === "escape" && this.focusMode) this.closeBeside(cx);
     const [scope, action, ...rest] = c.split(":");
-    if (scope === "home") this.menuAction(action, rest.join(":"), cx);
+    if (scope === "home" && action === "prs") startFromHome(rest.join(":"), [...(prs()?.mine ?? []), ...(prs()?.assigned ?? [])], this.prcfg, cx);
+    else if (scope === "home") this.menuAction(action, rest.join(":"), cx);
     cx.notify();
   }
 
@@ -671,6 +678,9 @@ export default class Home {
     const k = tokens();
     const inbox = this.apps.inbox?.counts ?? {};
     const prs = this.apps.inbox?.prs ?? [];
+    const pd = prsData();
+    const mine = pd?.mine ?? [];
+    const theirs = (pd?.assigned ?? []).filter((p) => p.turn?.who !== "none");
     const week = this.home?.week?.by_day ?? [];
     const shipped = week.reduce((n, d) => n + (d.count ?? 0), 0);
     const landed = (this.home?.landed?.days ?? []).map((d) => d.count ?? 0);
@@ -686,8 +696,8 @@ export default class Home {
       .gap(12)
       .flex_wrap()
       .child(tile("kpi-agents", { label: "Agents", icon: "bot", value: needs ? `${needs} need you` : String(cols.working.length + cols.needs.length + cols.done.length), hint: `${cols.working.length} working · ${cols.done.length} done`, onClick: () => needs && goToAgent(cols.needs.find((c) => c.agent).agent) }))
-      .child(tile("kpi-reviews", { label: "Reviews for you", icon: "eye", value: String(inbox.direct ?? 0), hint: `${Math.max(0, (inbox.reviews ?? 0) - (inbox.direct ?? 0))} for your team`, onClick: () => show("inbox") }))
-      .child(tile("kpi-prs", { label: "Your PRs", icon: "git-pull-request", value: String(prs.length), hint: [ready && `${ready} ready`, fix && `${fix} to fix`].filter(Boolean).join(" · ") || "nothing to do", onClick: () => show("inbox") }))
+      .child(tile("kpi-reviews", { label: "Reviews for you", icon: "eye", value: String(pd ? theirs.filter((p) => p.turn?.who === "you").length : inbox.direct ?? 0), hint: pd ? `${theirs.filter((p) => p.turn?.why === "re-review").length} re-requested · ${theirs.length} open` : `${Math.max(0, (inbox.reviews ?? 0) - (inbox.direct ?? 0))} for your team`, onClick: () => show("prs") }))
+      .child(tile("kpi-prs", { label: "Your PRs", icon: "git-pull-request", value: String(pd ? mine.length : prs.length), hint: pd ? `${mine.filter((p) => p.turn?.who === "you").length} on you · ${mine.filter((p) => p.turn?.who === "them").length} waiting` : [ready && `${ready} ready`, fix && `${fix} to fix`].filter(Boolean).join(" · ") || "nothing to do", onClick: () => show("prs") }))
       .child(tile("kpi-shipped", { label: "Merged this week", icon: "git-merge", value: String(shipped), hint: `${landed.at(-1) ?? 0} today` }))
       .when(Boolean(spend), (e) => e.child(tile("kpi-spend", { label: "Agent spend", icon: "dollar", value: money(spend.today ?? 0), hint: `${money(spend.week ?? 0)} these 7 days` })));
   }
@@ -700,7 +710,7 @@ export default class Home {
       .gap(18)
       .when(Boolean(this.nextMove(cols, narrow)), (e) => e.child(this.nextMove(cols, narrow)))
       .child(this.board(cols, wide, narrow))
-      .when(cols.prs.length > 0, (e) => e.child(this.prList(cols.prs, narrow)));
+      .child(prs() ? PrSections(prs(), { cardBox: this.cardBox(narrow), show, openUrl: (cx, u) => this.openUrl(cx, u) }) : cols.prs.length > 0 ? this.prList(cols.prs, narrow) : null);
     const right = v_flex()
       .w(320)
       .flex_none()

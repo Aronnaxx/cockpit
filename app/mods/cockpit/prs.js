@@ -5,9 +5,9 @@
 
 import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState } from "gpui-base";
-import { exec, notify } from "herdr";
+import { exec, notify, run, shared } from "herdr";
 import * as hub from "./hub.js";
-import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mono, Progress, Spinner, TextField } from "./ui.js";
+import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mono, Progress, Spinner, TextField, Tabs, Chip } from "./ui.js";
 import { loadPrs, prs, prsConfig, ago } from "./prsdata.js";
 import { LAUNCH_AGENTS, launchAgent, lastAgent, prPrompt, repoFolder } from "./agentlaunch.js";
 import { OmoModel } from "./agentsui.js";
@@ -21,12 +21,31 @@ const TASKS = {
 export default class Prs {
   init(_p, cx) {
     this.sel = null;
+    this.scope = "all";
+    this.repoF = null;
     this.ci = new Map();
     this.cfg = {};
     this.busy = null;
     this.agent = lastAgent();
     this.task = null;
-    this.model = InputState.new({ placeholder: "model (optional, e.g. opus, gpt-6.1-sol)" });
+    this.model = InputState.new({ placeholder: "search the gateway's models, or type one" });
+    // The gateway's models, searched as you type (bin/cockpit-models.py).
+    this.models = [];
+    this.modelOpen = false;
+    this.model.on("focus", (_e, cx) => ((this.modelOpen = true), cx.notify()));
+    this.model.on("change", (_e, cx) => ((this.modelOpen = true), cx.notify()));
+    cx.spawn(async (cx) => {
+      try {
+        const { home } = await hub.install();
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-models.py`], { timeout: 30000 });
+        this.models = JSON.parse(r.stdout || "{}").models ?? [];
+      } catch {}
+      cx.notify();
+    });
+    // Each pull request's conversation (read when it is picked) and the worktrees made this session.
+    this.convo = new Map();
+    this.openThreads = new Set();
+    this.worktrees = new Set();
     this.omo = new OmoModel();
     this.omo.follow(cx);
     const pull = (cx, force) =>
@@ -59,12 +78,52 @@ export default class Prs {
   select(cx, p) {
     this.sel = keyOf(p);
     this.task = null;
+    if (!this.convo.has(keyOf(p))) this.readConvo(cx, p);
     const url = p.ci?.builds?.[0];
     if (url && !this.ci.has(url)) {
       this.ci.set(url, "loading");
       this.readCi(cx, url);
     }
     cx.notify();
+  }
+
+  readConvo(cx, p) {
+    this.convo.set(keyOf(p), "loading");
+    cx.spawn(async (cx) => {
+      try {
+        const { home } = await hub.install();
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-pr-comments.py`, p.repo, String(p.number)], { timeout: 90000 });
+        this.convo.set(keyOf(p), JSON.parse(r.stdout || "null") ?? { error: "no answer", items: [] });
+      } catch (e) {
+        this.convo.set(keyOf(p), { error: String(e?.message ?? e).slice(0, 160), items: [] });
+      }
+      cx.notify();
+    });
+  }
+
+  /** A worktree of the pull request's head (bin/cockpit-worktree.py), opened in a new tab to read and run its code. */
+  worktree(cx, p, remove = false) {
+    cx.spawn(async (cx) => {
+      try {
+        const { home } = await hub.install();
+        const folder = repoFolder(p.repo, this.cfg).replace(/^~/, home);
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-worktree.py`, p.repo, String(p.number), folder, ...(remove ? ["--remove"] : [])], { timeout: 400000 });
+        const d = JSON.parse(r.stdout || "{}");
+        if (d.error) return notify({ title: "No worktree", body: d.error });
+        if (remove) {
+          this.worktrees.delete(keyOf(p));
+          notify({ title: "Worktree removed", body: d.removed });
+        } else {
+          this.worktrees.add(keyOf(p));
+          run("tab.new", { name: `${p.repo.split("/")[1]}#${p.number}`, folder: d.path });
+          run("layout.select", { stack: "center", child: "work" });
+          notify({ title: d.reused ? "Worktree updated" : "Worktree ready", body: d.path });
+        }
+      } catch (e) {
+        notify({ title: "No worktree", body: String(e?.message ?? e).slice(0, 160) });
+      }
+      cx.notify();
+    });
   }
 
   readCi(cx, url, retry = false) {
@@ -85,10 +144,81 @@ export default class Prs {
   /** Starts the picked agent (or `agent`) on a pull request with the task's prompt. */
   start(cx, p, kind, agent = this.agent) {
     cx.spawn(async (cx) => {
-      const ok = await launchAgent({ agent, prompt: prPrompt(kind, { ...p, ci: { failed: this.failedJobs(p) } }), folder: repoFolder(p.repo, this.cfg), name: `${kind} ${p.repo.split("/")[1]}#${p.number}`, model: this.model.value().trim() || null });
+      const ok = await launchAgent({ agent, prompt: prPrompt(kind, { ...p, ci: { failed: this.failedJobs(p) } }), folder: repoFolder(p.repo, this.cfg), name: `${kind} ${p.repo.split("/")[1]}#${p.number}`, model: this.modelValue() });
       if (ok) notify({ title: "Agent started", body: `${LAUNCH_AGENTS.find((a) => a.id === agent)?.label ?? agent} is on ${keyOf(p)}.` });
       cx.notify();
     });
+  }
+
+  /** The model typed or picked; OpenCode names a gateway model as litellm/<id>. */
+  modelValue() {
+    const m = this.model.value().trim();
+    if (!m) return null;
+    return this.agent === "opencode" && this.models.includes(m) ? `litellm/${m}` : m;
+  }
+
+  /** The conversation as GitHub shows it: comments, reviews, and threads on a line with the diff around it. */
+  conversation(k, p) {
+    const c = this.convo.get(keyOf(p));
+    const head = (author, what, at, extra) =>
+      h_flex().gap(8).items_center().child(div().size(20).flex_none().rounded(10).flex().items_center().justify_center().bg(alpha(k.info, 0.18)).text_size(10).font_semibold().text_color(k.info).child(author.slice(0, 2).toUpperCase())).child(div().text_size(TEXT.sm).font_semibold().text_color(k.foreground).child(author)).child(div().text_size(TEXT.xs).text_color(k.dim).child(`${what} ${ago(at)} ago`)).child(div().flex_1()).children([extra].filter(Boolean));
+    const body = (text) => (text ? div().text_size(TEXT.sm).text_color(k.foreground).whitespace_normal().child(text.length > 1600 ? `${text.slice(0, 1600)}…` : text) : null);
+    const chip = (label, color) => div().flex_none().px(6).h(16).flex().items_center().rounded(4).text_size(10).bg(alpha(color, 0.14)).text_color(color).child(label);
+    if (!c || c === "loading") return h_flex().gap(8).items_center().text_color(k.mutedFg).child(Spinner({ size: 12 })).child("Reading the conversation…");
+    const items = (c.items ?? []).map((it, i) => {
+      const id = `cv-${keyOf(p)}-${i}`;
+      if (it.kind === "thread") {
+        const open = this.openThreads.has(id) ? true : !it.resolved && !this.openThreads.has(`-${id}`);
+        return v_flex()
+          .id(id)
+          .gap(6)
+          .p(10)
+          .rounded(RADIUS.md)
+          .border_1()
+          .border_color(k.border)
+          .child(
+            h_flex().gap(8).items_center().cursor_pointer().on_click((_e, cx) => { open ? (this.openThreads.delete(id), this.openThreads.add(`-${id}`)) : (this.openThreads.add(id), this.openThreads.delete(`-${id}`)); cx.notify(); })
+              .child(Mono(`${it.path}${it.line ? `:${it.line}` : ""}`, { size: TEXT.xs, color: k.foreground }))
+              .child(div().flex_1())
+              .when(it.resolved, (e) => e.child(chip("resolved", k.success)))
+              .when(it.outdated, (e) => e.child(chip("outdated", k.warning)))
+              .child(div().text_size(TEXT.xs).text_color(k.dim).child(`${it.comments.length} comment${it.comments.length === 1 ? "" : "s"} · ${open ? "hide" : "show"}`)),
+          )
+          .when(open, (e) =>
+            e
+              .when(Boolean(it.hunk), (x) => x.child(v_flex().p(6).rounded(RADIUS.sm).bg(alpha(k.muted, 0.7)).children(it.hunk.split("\n").slice(-10).map((l, j) => div().id(`${id}-h${j}`).text_size(10.5).font_family("JetBrains Mono").whitespace_nowrap().text_color(l.startsWith("+") ? k.success : l.startsWith("-") ? k.destructive : k.mutedFg).child(l || " ")))))
+              .children(it.comments.map((cm, j) => v_flex().id(`${id}-c${j}`).gap(4).child(head(cm.author, "commented", cm.at)).child(body(cm.body)))),
+          );
+      }
+      return v_flex()
+        .id(id)
+        .gap(6)
+        .p(10)
+        .rounded(RADIUS.md)
+        .border_1()
+        .border_color(it.kind === "review" && it.state === "changes_requested" ? alpha(k.destructive, 0.5) : it.kind === "review" && it.state === "approved" ? alpha(k.success, 0.5) : k.border)
+        .child(head(it.author, it.kind === "review" ? "reviewed" : "commented", it.at, it.kind === "review" ? chip(it.state.replace("_", " "), it.state === "approved" ? k.success : it.state === "changes_requested" ? k.destructive : k.mutedFg) : null))
+        .child(body(it.body));
+    });
+    return v_flex().gap(8).children(c.error ? [div().text_size(TEXT.xs).text_color(k.warning).child(c.error)] : items.length ? items : [div().text_size(TEXT.sm).text_color(k.dim).child("No comments yet.")]);
+  }
+
+  /** The searchable list under the model field: the gateway's models that match what is typed. */
+  modelList(k) {
+    if (!this.modelOpen) return null;
+    const q = this.model.value().trim().toLowerCase();
+    const hits = (q ? this.models.filter((m) => m.toLowerCase().includes(q)) : this.models).slice(0, 60);
+    if (!hits.length) return div().text_size(TEXT.xs).text_color(k.dim).child(this.models.length ? "No gateway model matches: it is used as typed." : "The gateway's models could not be read (set litellm.base_url in the config): type one.");
+    return v_flex()
+      .id("model-list")
+      .max_h(200)
+      .overflow_y_scrollbar()
+      .rounded(RADIUS.md)
+      .border_1()
+      .border_color(k.border)
+      .bg(k.card)
+      .p(4)
+      .children(hits.map((m) => div().id(`model-${m}`).px(8).h(26).flex().items_center().rounded(RADIUS.sm).cursor_pointer().text_size(TEXT.sm).font_family("JetBrains Mono").text_color(k.foreground).hover((x) => x.bg(k.accent)).on_click((_e, cx) => (this.model.set_value(m), (this.modelOpen = false), cx.notify())).child(m)));
   }
 
   /** The failed jobs by name: Buildkite's when read, else the checks GitHub lists as failed. */
@@ -165,7 +295,14 @@ export default class Prs {
           .child(h_flex().gap(8).items_center().child(Mono(`${p.repo}#${p.number}`, { color: k.mutedFg })).child(div().text_size(TEXT.xs).text_color(k.dim).child(`by ${p.author}`)).when(p.draft, (e) => e.child(Badge("draft", "warning"))))
           .child(div().text_size(18).font_semibold().whitespace_normal().child(p.title))
           .child(h_flex().gap(8).items_center().child(Mono(p.branch, { size: TEXT.xs, color: k.dim })).child(div().text_size(TEXT.xs).text_color(k.dim).child(`→ ${p.base}`)))
-          .child(h_flex().gap(6).pt(4).child(Button("prs-open", { label: "Open PR", icon: "external", size: "sm", variant: "outline", onClick: (_e, cx) => cx.spawn(async () => hub.openUrl(p.url)) }))),
+          .child(
+            h_flex()
+              .gap(6)
+              .pt(4)
+              .child(Button("prs-open", { label: "Open PR", icon: "external", size: "sm", variant: "outline", onClick: (_e, cx) => cx.spawn(async () => hub.openUrl(p.url)) }))
+              .child(Button("prs-worktree", { label: this.worktrees.has(keyOf(p)) ? "Open worktree" : "Explore in a worktree", icon: "git-branch", size: "sm", variant: "outline", tooltip: "A git worktree of this pull request's head in ~/worktrees, opened in a new tab; your own checkout is not touched", onClick: (_e, cx) => this.worktree(cx, p) }))
+              .when(this.worktrees.has(keyOf(p)), (e) => e.child(Button("prs-worktree-rm", { label: "Remove worktree", size: "sm", variant: "ghost", onClick: (_e, cx) => this.worktree(cx, p, true) }))),
+          ),
       )
       .child(
         h_flex()
@@ -196,6 +333,7 @@ export default class Prs {
           p.unresolved ? div().text_size(TEXT.xs).text_color(k.dim).child(`${p.unresolved} unresolved review thread${p.unresolved === 1 ? "" : "s"}`) : null,
         ),
       )
+      .child(section(`Conversation`, this.conversation(k, p)))
       .child(
         section(
           "CI",
@@ -226,8 +364,9 @@ export default class Prs {
             taskRow,
             div().text_size(TEXT.xs).text_color(k.dim).child("Agent"),
             agentRow,
-            div().text_size(TEXT.xs).text_color(k.dim).child("Model"),
-            TextField(this.model),
+            div().text_size(TEXT.xs).text_color(k.dim).child(`Model${this.models.length ? ` · ${this.models.length} on the gateway` : ""}`),
+            h_flex().gap(6).items_center().child(TextField(this.model)).child(Button("prs-model-toggle", { icon: this.modelOpen ? "chevron-up" : "chevron-down", variant: "outline", size: "icon-sm", tooltip: "The gateway's models", onClick: (_e, cx) => ((this.modelOpen = !this.modelOpen), cx.notify()) })),
+            this.modelList(k),
             this.agent === "opencode" && here?.presets?.length
               ? v_flex().gap(6).child(div().text_size(TEXT.xs).text_color(k.dim).child("OMO preset (this computer; new sessions use it)")).child(h_flex().gap(6).flex_wrap().children(here.presets.map((n) => Button(`prs-omo-${n}`, { label: n, size: "sm", variant: n === here.preset ? "default" : "outline", onClick: (_e, cx) => cx.spawn(async (cx) => { const r = await this.omo.set(null, n); notify({ title: r.error ? "Could not change the preset" : "OMO preset", body: r.error ?? r.note }); cx.notify(); }) }))))
               : null,
@@ -250,8 +389,23 @@ export default class Prs {
             .children(items.map((p) => this.row(k, p)))
         : null;
     const order = (a, b) => (b.turn?.who === "you") - (a.turn?.who === "you") || b.last_activity - a.last_activity;
-    const mine = [...(d?.mine ?? [])].sort(order);
-    const theirs = [...(d?.assigned ?? [])].filter((p) => p.turn?.who !== "none").sort(order);
+    // Home's "Details" leaves the pull request to open in this shared value.
+    const want = shared("cockpit.prs.focus");
+    if (want && want !== this.focused) {
+      this.focused = want;
+      const hit = list.find((p) => keyOf(p) === want);
+      if (hit) { this.scope = "all"; this.repoF = null; cx.timer.after(1, (cx) => this.select(cx, hit)); }
+    }
+    const allMine = [...(d?.mine ?? [])].sort(order);
+    const allTheirs = [...(d?.assigned ?? [])].filter((p) => p.turn?.who !== "none").sort(order);
+    const repos = [...new Set([...allMine, ...allTheirs].map((p) => p.repo))].sort();
+    const inRepo = (p) => !this.repoF || p.repo === this.repoF;
+    const mine = this.scope === "review" ? [] : allMine.filter(inRepo);
+    const theirs = this.scope === "mine" ? [] : allTheirs.filter(inRepo);
+    const filters = v_flex()
+      .gap(8)
+      .child(Tabs("prs-scope", { value: this.scope, onChange: (v, cx) => ((this.scope = v), cx.notify()), items: [{ value: "all", label: "All", count: allMine.length + allTheirs.length }, { value: "mine", label: "Mine", count: allMine.length }, { value: "review", label: "To review", count: allTheirs.length }] }))
+      .child(h_flex().gap(6).flex_wrap().children([Chip("all repos", { id: "prs-repo-all", color: this.repoF ? undefined : k.ring, onClick: (_e, cx) => ((this.repoF = null), cx.notify()) }), ...repos.map((r) => Chip(r.split("/")[1], { id: `prs-repo-${r}`, color: this.repoF === r ? k.ring : undefined, onClick: (_e, cx) => ((this.repoF = this.repoF === r ? null : r), cx.notify()) }))]));
     const sel = list.find((p) => keyOf(p) === this.sel) ?? null;
     const yours = list.filter((p) => p.turn?.who === "you").length;
     return v_flex()
@@ -280,7 +434,7 @@ export default class Prs {
                 .gap(16)
                 .px(24)
                 .py(16)
-                .child(v_flex().id("prs-list").w(380).flex_none().min_h(0).gap(10).overflow_y_scrollbar().children([group("Your pull requests", mine), group("Waiting for your review", theirs)].filter(Boolean)))
+                .child(v_flex().id("prs-list").w(380).flex_none().min_h(0).gap(10).overflow_y_scrollbar().children([filters, group("Your pull requests", mine), group("Waiting for your review", theirs)].filter(Boolean)))
                 .child(v_flex().id("prs-detail-scroll").flex_1().min_w(0).min_h(0).overflow_y_scrollbar().child(sel ? this.detail(k, sel, cx) : Empty({ icon: "git-pull-request", title: "Pick a pull request", description: "Its reviewers, CI and an agent to work on it show here." }))),
       );
   }

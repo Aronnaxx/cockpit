@@ -12,14 +12,14 @@ export function loadPrs({ force = false } = {}) {
   running = (async () => {
     try {
       const { home } = await hub.install();
-      const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-prs.py`, ...(force ? ["--force"] : [])], { timeout: 90000 });
+      const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/bin/cockpit-prs.py`, ...(force ? ["--force"] : [])], { timeout: 90000 });
       const d = JSON.parse(r.stdout || "null");
       if (d) {
         setShared("cockpit.prs", d);
         const mine = (d.mine ?? []).filter((p) => p.turn?.who === "you").length;
         const reviews = (d.assigned ?? []).filter((p) => p.turn?.who === "you").length;
         const n = mine + reviews;
-        setShared("badge.prs", n ? { count: n, tone: "warning" } : null);
+        setShared("badge.prs", { count: n, tone: "warning" });
       }
       return d;
     } catch {
