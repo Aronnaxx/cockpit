@@ -5,7 +5,10 @@
 
 import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState } from "gpui-base";
-import { exec, focused, panes, agents, layout, props, shared, setShared } from "herdr";
+import { exec, focused, panes, agents, layout, props, shared, setShared, readTextFile, writeTextFile } from "herdr";
+import { prs } from "./prsdata.js";
+import { draftFile } from "./prreview.js";
+import { prBeside } from "./beside.js";
 import * as hub from "./hub.js";
 import { ModelPicker } from "./modelpick.js";
 import { openCode } from "./code.js";
@@ -167,6 +170,43 @@ export default class Review {
             action: { label: "Undo", onClick: () => (this.diff.comments = kept) },
           });
         }
+      } catch (e) {
+        this.toasts.push(cx, String(e?.message ?? e), { kind: "error" });
+      }
+      this.badge();
+      cx.notify();
+    });
+  }
+
+  /** The pull request this view's PR scope shows, as the PRs page has it (its draft, its page). */
+  pr() {
+    const url = this.model?.about?.pr?.url ?? "";
+    const m = url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+    if (!m) return null;
+    const d = prs();
+    return [...(d?.mine ?? []), ...(d?.assigned ?? [])].find((p) => p.repo === m[1] && p.number === Number(m[2])) ?? { repo: m[1], number: Number(m[2]), url };
+  }
+
+  /** The comments written here go into the pull request's review draft (what the PR page edits and posts) instead of to the agent.
+   *  A comment on a removed line stays here: the draft comments on the new version of the file. */
+  toDraft(cx) {
+    const p = this.pr();
+    const all = this.diff.review();
+    const take = all.filter((c) => !c.old && c.line);
+    if (!p || !take.length) return;
+    cx.spawn(async (cx) => {
+      try {
+        const { home } = await hub.install();
+        const file = draftFile(home, p);
+        const before = await readTextFile(file).catch(() => null);
+        const d = before ? JSON.parse(before) : { summary: "", verdict: "COMMENT", comments: [] };
+        d.comments = [...(d.comments ?? []), ...take.map((c) => ({ path: c.path, line: c.line, body: c.text }))];
+        if (before === null) await exec("mkdir", ["-p", file.replace(/\/[^/]+$/, "")]);
+        await writeTextFile(file, JSON.stringify(d, null, 2) + "\n", before);
+        const kept = new Set(take.map((c) => `${c.path}:${c.line}:${c.text}`));
+        this.diff.comments = this.diff.comments.filter((c) => !kept.has(`${c.path}:${c.line}:${c.text}`));
+        const left = all.length - take.length;
+        this.toasts.push(cx, `${take.length} comment${take.length === 1 ? "" : "s"} in your review draft of ${p.repo.split("/")[1]}#${p.number}${left ? ` · ${left} on removed lines stay here` : ""}`, { kind: "success", action: { label: "Open the PR", onClick: () => prBeside(p, this.terminal) } });
       } catch (e) {
         this.toasts.push(cx, String(e?.message ?? e), { kind: "error" });
       }
@@ -365,6 +405,9 @@ export default class Review {
         this.toasts.push(cx, `${kept.length} comment${kept.length === 1 ? "" : "s"} cleared`, { action: { label: "Undo", onClick: () => (this.diff.comments = kept) } });
         this.badge();
       } })))
+      .when(this.scope === "pr" && Boolean(this.pr()), (e) => e
+        .child(Button("review-pr-page", { label: narrow ? undefined : "PR page", icon: "columns", size: narrow ? "icon-sm" : "sm", variant: "ghost", tooltip: "The pull request's page beside the agent: its draft, Explain, Quiz me", onClick: () => prBeside(this.pr(), this.terminal) }))
+        .child(Button("review-to-draft", { label: n ? `Add to my review draft · ${n}` : "Add to my review draft", icon: "file-text", size: "sm", variant: "outline", disabled: !n, tooltip: "These comments go into the PR's review draft (edited and posted from the PR page), not to the agent", onClick: (_e, cx) => this.toDraft(cx) })))
       .child(Button("review-submit", {
         label: n ? `Submit review · ${n}` : "Submit review",
         icon: "send",

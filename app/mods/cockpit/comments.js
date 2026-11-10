@@ -55,10 +55,12 @@ export default class Comments {
     const a = agents().find((x) => x.focused) ?? agents().find((x) => x.address === f?.terminal);
     const tab = a ? spaces().flatMap((s) => s.tabs).find((t) => t.id === a.tab)?.name : null;
     const hit = tab ? reviewOf(tab) : null;
-    if (hit) return hit;
     const branch = panes().find((p) => p.terminal === f?.terminal)?.branch;
     const d = prs();
-    return branch ? [...(d?.mine ?? []), ...(d?.assigned ?? [])].find((p) => p.branch === branch) ?? null : null;
+    const found = hit ?? (branch ? [...(d?.mine ?? []), ...(d?.assigned ?? [])].find((p) => p.branch === branch) ?? null : null);
+    // The focus on something that is not a terminal (the PR's own pane beside the agent, a panel): the last one stays.
+    if (found) this.last = found;
+    return found ?? (!f?.terminal ? this.last ?? null : null);
   }
 
   render() {

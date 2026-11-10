@@ -9,8 +9,10 @@ import { tokens, alpha, TEXT, RADIUS, TextField } from "./ui.js";
 
 export class ModelPicker {
   /** Make it in `init` (it creates an input). */
-  constructor(cx, { placeholder = "Search the gateway's models", store = null } = {}) {
+  constructor(cx, { placeholder = "Search the gateway's models", store = null, onPick = null } = {}) {
     this.store = store;
+    // Called with the model when one is clicked (a setting that saves it).
+    this.onPick = onPick;
     this.models = [];
     this.open = false;
     let last = "";
@@ -61,6 +63,7 @@ export class ModelPicker {
                   try {
                     if (this.store) localStorage.setItem(this.store, m);
                   } catch {}
+                  this.onPick?.(m, cx);
                   cx.notify();
                 }),
               ),

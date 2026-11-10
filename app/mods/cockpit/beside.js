@@ -23,4 +23,6 @@ export function prBeside(p, terminal = null) {
   const at = anchor(terminal);
   toTab();
   run("pane.split", { direction: "right", ...(at ? { pane: at.pane } : {}), mod: "cockpit", props: { app: "prs", pr: `${p.repo}#${p.number}`, docked: true } });
+  // The side panel's room goes to the two panes; it opens again from the top bar.
+  run("layout.hide", { id: "panel" });
 }

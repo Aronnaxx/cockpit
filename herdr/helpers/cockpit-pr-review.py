@@ -5,7 +5,8 @@ Posts a review draft to GitHub, once the person has read the preview and confirm
 (COMMENT, APPROVE or REQUEST_CHANGES) and line comments, then each reply under its thread. The draft is
 {"summary": "", "verdict": "COMMENT", "comments": [{"path": "", "line": 1, "body": "", "reply_to": null}]}; a comment with
 `reply_to` (a review comment's id) is a reply, any other is a line comment. --pending sends it as a pending review only you see (no replies); --dry-run prints what would be sent and sends
-nothing. On success the draft file is removed. Prints JSON {posted, replies} or {error}.
+nothing. --submit-pending: the draft is kept in sync with your pending review on GitHub (cockpit-pr-pending.py), so that
+review is submitted with the verdict and summary rather than a second one made; then the replies. On success the draft file is removed. Prints JSON {posted, replies} or {error}.
 """
 
 import json
@@ -56,10 +57,23 @@ def main():
         if replies:
             print(json.dumps({"error": "Replies to threads cannot be kept pending; post or remove them first"}))
             return 0
+    if "--submit-pending" in sys.argv and not dry:
+        me = gh("api", "user", "--jq", ".login").stdout.strip()
+        have = gh("api", f"repos/{slug}/pulls/{number}/reviews", "--paginate", "--jq", f'.[] | select(.state=="PENDING" and .user.login=="{me}") | .id').stdout.split()
+        if have:
+            r = gh("api", f"repos/{slug}/pulls/{number}/reviews/{have[0]}/events", "--method", "POST", "--input", "-", data=json.dumps({"event": verdict, "body": summary}))
+            if r.returncode != 0:
+                print(json.dumps({"error": (r.stderr.strip().splitlines() or ["gh failed"])[-1][:240]}))
+                return 0
+            lines_done = True
+        else:
+            lines_done = False
+    else:
+        lines_done = False
     if dry:
         print(json.dumps({"dry_run": True, "review": payload, "replies": [{"to": c["reply_to"], "body": c["body"]} for c in replies]}))
         return 0
-    if pending or summary or lines or verdict != "COMMENT":
+    if not lines_done and (pending or summary or lines or verdict != "COMMENT"):
         r = gh("api", f"repos/{slug}/pulls/{number}/reviews", "--method", "POST", "--input", "-", data=json.dumps(payload))
         if r.returncode != 0:
             print(json.dumps({"error": (r.stderr.strip().splitlines() or ["gh failed"])[-1][:240]}))
@@ -75,6 +89,8 @@ def main():
         print(json.dumps({"pending": len(lines)}))
         return 0
     os.remove(path)
+    if os.path.exists(path + ".pending.json"):
+        os.remove(path + ".pending.json")
     print(json.dumps({"posted": len(lines), "replies": sent}))
     return 0
 

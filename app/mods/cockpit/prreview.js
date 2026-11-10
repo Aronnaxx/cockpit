@@ -6,7 +6,7 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState, TextareaState, Textarea, Input, TextView } from "gpui-base";
 import { exec, notify, readTextFile, writeTextFile } from "herdr";
 import * as hub from "./hub.js";
-import { tokens, alpha, TEXT, RADIUS, Badge, Button, Tabs, Mono, Spinner } from "./ui.js";
+import { tokens, alpha, TEXT, RADIUS, Badge, Button, Tabs, Mono, Spinner, Toggle } from "./ui.js";
 import { CodeRows } from "./codeblock.js";
 
 const keyOf = (p) => `${p.repo}#${p.number}`;
@@ -35,6 +35,56 @@ export class Drafts {
     this.whyBusy = new Set();
     // The gateway model that explains (set by the page).
     this.modelOf = () => "";
+    // Kept in sync with your pending review on GitHub (bin/cockpit-pr-pending.py): key -> {on, busy, at, error, conflict, exists}.
+    this.sync = new Map();
+  }
+
+  /** The pending-review helper: status, push (the draft to GitHub), pull (GitHub's to the draft) or off. */
+  pending(cx, p, op, { force = false } = {}) {
+    const key = keyOf(p);
+    const st = { ...(this.sync.get(key) ?? {}) };
+    st.busy = op;
+    this.sync.set(key, st);
+    cx.notify();
+    return new Promise((resolve) =>
+      cx.spawn(async (cx) => {
+        let d = {};
+        try {
+          const { home } = await hub.install();
+          const e = this.m.get(key);
+          if (e?.exists && op === "push") await this.save(e);
+          const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-pr-pending.py`, p.repo, String(p.number), draftFile(home, p), op, ...(force ? ["--force"] : [])], { timeout: 180000 });
+          d = JSON.parse(r.stdout || "{}");
+        } catch (err) {
+          d = { error: String(err?.message ?? err).slice(0, 200) };
+        }
+        const next = { ...(this.sync.get(key) ?? {}), busy: null, error: d.error ?? null };
+        if (op === "status") Object.assign(next, { on: Boolean(d.sync), exists: d.exists, conflict: d.sync && d.changed ? { summary: d.summary, comments: d.comments ?? [] } : null, at: d.synced_at ?? next.at });
+        if (op === "push") Object.assign(next, d.conflict ? { on: true, conflict: { summary: d.summary, comments: d.comments ?? [] } } : d.error ? {} : { on: true, conflict: null, exists: (d.synced ?? 0) > 0, at: Date.now(), replies: d.replies_kept ?? 0 });
+        if (op === "pull" && !d.error) {
+          Object.assign(next, { on: true, conflict: null, exists: true, at: Date.now() });
+          this.m.delete(key);
+          await this.load(cx, p);
+        }
+        if (op === "off") Object.assign(next, { on: false, conflict: null });
+        this.sync.set(key, next);
+        cx.notify();
+        resolve(d);
+      }),
+    );
+  }
+
+  /** A push a few seconds after the last save, while syncing is on. */
+  schedulePush(cx, p) {
+    const key = keyOf(p);
+    const st = this.sync.get(key);
+    if (!st?.on || st.conflict) return;
+    st.version = (st.version ?? 0) + 1;
+    const mine = st.version;
+    cx.timer.after(4000, (cx) => {
+      const now = this.sync.get(key);
+      if (now?.version === mine && now.on && !now.busy && !now.conflict) this.pending(cx, p, "push");
+    });
   }
 
   /** Reads the draft file; true when what it shows changed (an agent wrote it, or the first read). */
@@ -181,7 +231,7 @@ export class Drafts {
     cx.timer.after(500, () => {
       if (e.version !== mine) return;
       for (const r of e.rows) { const path = r.path.value().trim(); if (path && !r.reply_to) this.ensureFile(cx, e.p, path); }
-      e.chain = e.chain.then(() => this.save(e)).catch(() => {});
+      e.chain = e.chain.then(() => this.save(e)).then(() => this.schedulePush(cx, e.p)).catch(() => {});
     });
   }
 
@@ -249,7 +299,18 @@ export class Drafts {
         const e = this.m.get(keyOf(p));
         if (e?.exists) await this.save(e);
         const { home } = await hub.install();
-        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-pr-review.py`, p.repo, String(p.number), draftFile(home, p), ...(pending ? ["--pending"] : [])], { timeout: 180000 });
+        // Synced: the pending review on GitHub is brought up to date and submitted, rather than a second review made.
+        const synced = this.sync.get(keyOf(p))?.on;
+        if (synced) {
+          const pushed = await this.pending(cx, p, "push");
+          if (pushed.conflict || pushed.error) {
+            notify({ title: "Review not posted", body: pushed.conflict ? "Your pending review on GitHub changed outside the cockpit: pick which to keep first." : pushed.error });
+            this.busy = null;
+            this.confirm = null;
+            return cx.notify();
+          }
+        }
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-pr-review.py`, p.repo, String(p.number), draftFile(home, p), ...(pending ? ["--pending"] : []), ...(synced ? ["--submit-pending"] : [])], { timeout: 180000 });
         const d = JSON.parse(r.stdout || "{}");
         if (d.error) notify({ title: pending ? "Not kept on GitHub" : "Review not posted", body: d.error });
         else if (d.pending !== undefined) notify({ title: "Kept as a pending review on GitHub", body: `${keyOf(p)}: ${d.pending} comment${d.pending === 1 ? "" : "s"}. Only you see it; open it in VS Code's pull request view and submit it there, or keep editing here.` });
@@ -257,6 +318,7 @@ export class Drafts {
           notify({ title: "Review posted", body: `${keyOf(p)}: ${d.posted} comment${d.posted === 1 ? "" : "s"}, ${d.replies} repl${d.replies === 1 ? "y" : "ies"}` });
           this.m.set(keyOf(p), { raw: null, exists: false });
           this.preview.delete(keyOf(p));
+          this.sync.delete(keyOf(p));
           done?.(cx);
         }
       } catch (err) {
@@ -277,6 +339,28 @@ export class Drafts {
     return div().w_full().rounded(RADIUS.md).border_1().border_color(k.input).bg(k.background).px(10).py(6).child(Textarea.new(state).w_full().text_size(TEXT.sm));
   }
 
+  /** Keeping the draft in sync with your pending review on GitHub: the switch, where it stands, and the choice when GitHub's
+   *  side was edited meanwhile (VS Code's pull request view, the PR page). */
+  syncRow(k, p, e) {
+    const st = this.sync.get(keyOf(p)) ?? {};
+    const on = Boolean(st.on);
+    const status = st.busy === "push" ? "Sending to GitHub…" : st.busy === "pull" ? "Taking GitHub's…" : st.busy === "status" && !st.at ? "Checking GitHub…" : st.error ? st.error : on ? (st.at ? `In sync · ${Math.max(0, Math.round((Date.now() - st.at) / 60000))}m ago${st.replies ? ` · ${st.replies} repl${st.replies === 1 ? "y stays" : "ies stay"} here (a reply cannot be pending)` : ""}` : "On") : st.exists ? "You have a pending review on GitHub that is not kept in sync" : "Only you see a pending review; VS Code's pull request view lists and edits it";
+    const box = st.conflict
+      ? v_flex().gap(8).p(10).rounded(RADIUS.md).border_1().border_color(alpha(k.warning, 0.6)).bg(alpha(k.warning, 0.08))
+          .child(div().text_size(TEXT.sm).font_semibold().text_color(k.warning).child("Your pending review on GitHub was changed outside the cockpit"))
+          .child(div().text_size(TEXT.xs).text_color(k.mutedFg).whitespace_normal().child(`GitHub's has ${st.conflict.comments.length} comment${st.conflict.comments.length === 1 ? "" : "s"}${st.conflict.summary ? " and a summary" : ""}; this draft has ${(e?.rows ?? []).filter((r) => !r.reply_to && r.body.value().trim()).length}. Nothing is sent until you pick.`))
+          .children(st.conflict.comments.slice(0, 4).map((c, i) => div().id(`rv-cf-${i}`).text_size(TEXT.xs).text_color(k.dim).truncate().child(`${String(c.path).split("/").pop()}:${c.start_line ? `${c.start_line}-` : ""}${c.line} · ${c.body}`)))
+          .child(h_flex().gap(8).child(Button("rv-sync-pull", { label: "Use GitHub's", icon: "git-pull-request", size: "sm", variant: "outline", tooltip: "GitHub's summary and line comments replace the draft's (replies and reasons are kept)", onClick: (_e, cx) => this.pending(cx, p, "pull") })).child(Button("rv-sync-force", { label: "Use mine", size: "sm", variant: "ghost", tooltip: "The draft replaces the pending review on GitHub", onClick: (_e, cx) => this.pending(cx, p, "push", { force: true }) })))
+      : null;
+    return v_flex().gap(8).pt(4).border_t_1().border_color(alpha(k.border, 0.6))
+      .child(h_flex().gap(10).items_center()
+        .child(Toggle(`rv-sync-${keyOf(p)}`, on, (cx) => this.pending(cx, p, on ? "off" : "push")))
+        .child(v_flex().flex_1().min_w(0).gap(1).child(div().text_size(TEXT.sm).text_color(k.foreground).child("Keep in sync as a pending review on GitHub")).child(div().text_size(TEXT.xs).text_color(st.error ? k.warning : k.dim).whitespace_normal().child(status)))
+        .when(Boolean(st.busy), (x) => x.child(Spinner({ size: 12 })))
+        .when(on && !st.busy, (x) => x.child(Button(`rv-sync-now-${keyOf(p)}`, { icon: "refresh-cw", size: "icon-sm", variant: "ghost", tooltip: "Check GitHub now", onClick: (_e, cx) => this.pending(cx, p, "status") }))))
+      .children([box].filter(Boolean));
+  }
+
   /** The review box, like GitHub's "Leave a comment": a summary, a verdict, the pending line comments, then Save draft or Post. */
   section(k, p, { agentButton } = {}) {
     const e = this.m.get(keyOf(p));
@@ -293,9 +377,9 @@ export class Drafts {
       e.exists ? Button("rv-preview", { label: showPreview ? "Back to editing" : "Preview", icon: showPreview ? "pencil" : "eye", size: "sm", variant: "ghost", onClick: (_e, cx) => { showPreview ? this.preview.delete(keyOf(p)) : this.preview.add(keyOf(p)); cx.notify(); } }) : null,
       e.exists ? Button("rv-discard", { label: "Discard", size: "sm", variant: "ghost", onClick: (_e, cx) => this.discard(cx, p) }) : null,
       Button("rv-save", { label: "Save draft", size: "sm", variant: "outline", disabled: empty, onClick: (_e, cx) => { e.chain = e.chain.then(() => this.save(e)).catch(() => {}); notify({ title: "Draft saved", body: `${keyOf(p)} · it stays here until you post it` }); cx.notify(); } }),
-      e.exists && !empty ? Button("rv-pending", { label: "Keep on GitHub as pending…", size: "sm", variant: "ghost", tooltip: "Sends it as a pending review only you see; VS Code's pull request view lists it", onClick: (_e, cx) => ((this.confirm = { p, pending: true }), cx.notify()) }) : null,
       Button("rv-post", { label: this.busy === keyOf(p) ? "Posting…" : "Post review…", size: "sm", disabled: this.busy === keyOf(p) || empty, onClick: (_e, cx) => ((this.confirm = { p }), cx.notify()) }),
     ].filter(Boolean));
+    const syncRow = this.syncRow(k, p, e);
     if (showPreview) {
       const verb = e.verdict === "APPROVE" ? "approved these changes" : e.verdict === "REQUEST_CHANGES" ? "requested changes" : "reviewed";
       return frame(
@@ -317,6 +401,7 @@ export class Drafts {
               .children([this.whyPanel(k, p, r)].filter(Boolean)));
         }),
         div().text_size(TEXT.xs).text_color(k.dim).child(`${lines} line comment${lines === 1 ? "" : "s"} and ${replies} repl${replies === 1 ? "y" : "ies"}; empty ones are left out.`),
+        syncRow,
         h_flex().justify_end().child(actions),
       );
     }
@@ -340,6 +425,7 @@ export class Drafts {
           .child(this.box(k, r.body))
           .children([this.whyPanel(k, p, r)].filter(Boolean)),
       ),
+      syncRow,
       h_flex().gap(8).items_center().child(Button("rv-add", { label: "Add a line comment", icon: "plus", size: "sm", variant: "ghost", onClick: (_e, cx) => this.addComment(cx, p) })).children([agentButton].filter(Boolean)).child(div().flex_1()).child(Tabs("rv-verdict", { value: e.verdict, onChange: setVerdict, items: VERDICTS.map(([value, label]) => ({ value, label })) })),
       h_flex().justify_end().child(actions),
     );

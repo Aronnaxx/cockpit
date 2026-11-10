@@ -3,11 +3,11 @@
 cockpit-explain.py pr <owner/name> <number> <model>
 cockpit-explain.py why <owner/name> <number> <comment index> <model>
 cockpit-explain.py fill <owner/name> <number>
-cockpit-explain.py quiz <owner/name> <number> <model>
+cockpit-explain.py quiz <owner/name> <number> <model> [--missed <file of questions answered wrong>]
 Explanations written by a model of the LiteLLM gateway (cockpit_gateway.py); nothing is written to GitHub.
 
 pr: what the pull request does and how it differs from its base, for a reader who did not write it: a headline, a summary,
-before/after by aspect, a diagram of the flow it changes (plain text art), the areas it touches (with their files) and what to
+before/after by aspect, a flowchart of the flow it changes, the areas it touches (with their files) and what to
 watch. Kept in ~/.cache/cockpit/explain/<owner>__<name>__<number>.json with the head it was written for, and printed. The
 lines changed per area are counted here from the diff, never by the model.
 
@@ -15,7 +15,9 @@ fill: an explanation a reviewing agent wrote itself (the cockpit-pr-review skill
 it was written for, counted here from the diff, as `pr` adds them.
 
 quiz: questions that check the person understands the change before they put their name on a review: what it does, how it
-behaves, and whether the draft's comments (the agent's) hold up. Multiple choice, each with the answer and why; kept in
+behaves, and whether the draft's comments (the agent's) hold up. Multiple choice, each with the answer and why. How hard and
+how many: quiz.difficulty ("basics", "standard", "deep") and quiz.count ("fit": by the size of the change and the draft, or a
+number) in the cockpit config. --missed: new questions on what the person got wrong last time. Kept in
 ~/.cache/cockpit/quiz/<owner>__<name>__<number>.json with the head, and printed.
 
 why: why a comment of the review draft (~/.cache/cockpit/review-drafts/...) was made: from the code it is on, the PR's diff of
@@ -240,13 +242,37 @@ QUIZ_SCHEMA = {
 
 QUIZ_SYSTEM = """You write a short quiz for an engineer who is about to put their name on a code review of a pull request, much of it drafted by an AI agent. The quiz checks that they understand the change themselves rather than passing on what the agent said. Ask about the code, never trivia (no "how many files", no names to memorise).
 
-Write 6 to 8 questions, multiple choice, four choices each, one right:
-- 3 or 4 on the change itself ("behaviour": what happens now in a concrete case, before vs after; "design": why it is built this way or what it trades off; "risk": what could break and for whom). Use concrete inputs and situations from the code.
-- 2 to 4 on the draft's comments ("comment", with "comment" set to the comment's index as given): does the comment's claim hold, what in the code makes it so, or what the right fix is. When a comment is wrong or overstated, the right answer says so. Do not leak the answer in the question.
+Write exactly {count} questions, multiple choice, four choices each, one right:
+- about half on the change itself ("behaviour": what happens now in a concrete case, before vs after; "design": why it is built this way or what it trades off; "risk": what could break and for whom). Use concrete inputs and situations from the code.
+- the rest on the draft's comments (none if it has none) ("comment", with "comment" set to the comment's index as given): does the comment's claim hold, what in the code makes it so, or what the right fix is. When a comment is wrong or overstated, the right answer says so. Do not leak the answer in the question.
 For other questions "comment" is -1. "answer" is the index (0-3) of the right choice; place it at varying positions. Make the wrong choices plausible to someone who only skimmed. "explain": two or three sentences on why the answer is right, pointing at the code (file and line)."""
 
 
-def quiz(slug, number, model):
+LEVELS = {
+    "basics": "Difficulty: basics. Ask what the change does and how it behaves in the common case, so someone who read the description and skimmed the diff carefully can answer. Wrong choices are clearly wrong on a careful read.",
+    "standard": "Difficulty: standard. Ask about concrete behaviour and the reasons behind the design, needing the diff read with care.",
+    "deep": "Difficulty: deep. Ask about edge cases, failure modes, concurrency and ordering, interplay between files and what happens to existing callers; questions that need the code itself, not the description. Wrong choices are plausible to someone who read the diff once.",
+}
+
+
+def quiz_shape(stats, comments):
+    """How hard and how many, from the config: a fitted count grows with the change's size and the draft's comments."""
+    try:
+        q = json.load(open(os.path.expanduser("~/.config/cockpit/config.json"))).get("quiz") or {}
+    except Exception:
+        q = {}
+    level = q.get("difficulty") if q.get("difficulty") in LEVELS else "standard"
+    count = q.get("count", "fit")
+    if isinstance(count, int) or str(count).isdigit():
+        n = max(2, min(20, int(count)))
+    else:
+        changed = sum(a + r for a, r in stats.values())
+        n = 3 + (changed > 40) + (changed > 150) + (changed > 400) + (changed > 1000) + (len(stats) > 8) + min(4, (len(comments) + 1) // 2)
+        n = max(4, min(14, n))
+    return level, n
+
+
+def quiz(slug, number, model, missed=None):
     meta = json.loads(gh("pr", "view", str(number), "-R", slug, "--json", "title,body,headRefOid"))
     diff = gh("pr", "diff", str(number), "-R", slug, timeout=120)
     name = f"{slug.replace('/', '__')}__{number}.json"
@@ -255,9 +281,13 @@ def quiz(slug, number, model):
     except Exception:
         draft = {}
     comments = [(i, c) for i, c in enumerate(draft.get("comments") or []) if c.get("path") and str(c.get("body", "")).strip()]
+    level, count = quiz_shape(file_stats(diff), comments)
     listed = "\n\n".join(f"[{i}] {c['path']} line {c.get('start_line') or c.get('line')}{'-' + str(c['line']) if c.get('start_line') else ''}:\n{c['body']}" for i, c in comments)
     prompt = f"Pull request {slug}#{number}: {meta['title']}\n\n{(meta.get('body') or '')[:4000]}\n\nThe draft's comments:\n{listed or '(none: ask only about the change)'}\n\nThe diff:\n{diff[:150000]}"
-    text, _ = cockpit_gateway.ask(model, [{"role": "system", "content": QUIZ_SYSTEM + "\n\nThe JSON schema:\n" + json.dumps(QUIZ_SCHEMA)}, {"role": "user", "content": prompt}], max_tokens=12000, schema=QUIZ_SCHEMA)
+    if missed:
+        prompt += "\n\nLast time the person got these wrong. Ask about the same parts of the code again, in new ways (other cases, other angles), without repeating these questions:\n" + "\n".join(f"- {m}" for m in missed[:10])
+    system = QUIZ_SYSTEM.replace("{count}", str(count)) + "\n\n" + LEVELS[level] + "\n\nThe JSON schema:\n" + json.dumps(QUIZ_SCHEMA)
+    text, _ = cockpit_gateway.ask(model, [{"role": "system", "content": system}, {"role": "user", "content": prompt}], max_tokens=16000, schema=QUIZ_SCHEMA)
     d = cockpit_gateway.as_json(text)
     by = dict(comments)
     qs = []
@@ -273,7 +303,7 @@ def quiz(slug, number, model):
         if q.get("about") == "comment" and c:
             q["path"], q["line"], q["start_line"] = c["path"], c.get("line"), c.get("start_line")
         qs.append(q)
-    out = {"questions": qs, "model": model, "head": meta["headRefOid"], "at": int(time.time() * 1000)}
+    out = {"questions": qs, "model": model, "head": meta["headRefOid"], "at": int(time.time() * 1000), "difficulty": level, "count": count, "focus": bool(missed)}
     folder = os.path.expanduser("~/.cache/cockpit/quiz")
     os.makedirs(folder, exist_ok=True)
     with open(os.path.join(folder, name + ".tmp"), "w") as f:
@@ -312,7 +342,8 @@ def main():
         elif len(a) >= 3 and a[0] == "fill":
             print(json.dumps(fill(a[1], a[2])))
         elif len(a) >= 4 and a[0] == "quiz":
-            print(json.dumps(marked("quiz", a[1], a[2], a[3], lambda: quiz(a[1], a[2], a[3]))))
+            missed = json.load(open(a[a.index("--missed") + 1])) if "--missed" in a else None
+            print(json.dumps(marked("quiz", a[1], a[2], a[3], lambda: quiz(a[1], a[2], a[3], missed))))
         elif len(a) >= 5 and a[0] == "why":
             print(json.dumps(explain_why(a[1], a[2], a[3], a[4])))
         else:

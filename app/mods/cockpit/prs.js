@@ -11,6 +11,7 @@ import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mo
 import { loadPrs, prs, prsConfig, ago } from "./prsdata.js";
 import { urgent, urgency, reviewOf } from "./prcards.js";
 import { ModelPicker } from "./modelpick.js";
+import { openSettings } from "./settings.js";
 import { Drafts } from "./prreview.js";
 import { PrFiles, parsePatch } from "./prfiles.js";
 import { installedEditors, openInEditor } from "./editors.js";
@@ -75,6 +76,11 @@ export default class Prs {
     this.drafts.modelOf = () => this.explainModel.value();
     this.jobs = new Map(); // "explain:<key>" | "quiz:<key>" -> {kind, p, model, at}: running in the background
     cx.timer.every(3000, (cx) => this.pollJobs(cx));
+    // A pending review kept in sync: GitHub's side checked for edits made there (VS Code, the PR page).
+    cx.timer.every(30000, (cx) => {
+      const p = this.list().find((x) => keyOf(x) === this.sel);
+      if (p && this.drafts.sync.get(keyOf(p))?.on && !this.drafts.sync.get(keyOf(p))?.busy) this.drafts.pending(cx, p, "status");
+    });
     cx.timer.every(30000, (cx) => this.autoJobs(cx));
     this.quiz = new Map(); // key -> the quiz (bin/cockpit-explain.py quiz) with your answers | "loading" | {error}
     this.explain = new Map(); // key -> the explanation (bin/cockpit-explain.py) | "loading" | {error}
@@ -90,7 +96,12 @@ export default class Prs {
         cx.notify();
         await loadPrs({ force });
         this.cfg = await prsConfig();
-        if (!this.explainModel.value()) this.explainModel.input.set_value(this.jobModel());
+        // The model set in Settings (explain.model) is the one shown; picking another here is for this page only.
+        const want = this.cfg?.explain?.model ?? "agy/gemini-3.8-flash-medium";
+        if (want !== this.seenModel || !this.explainModel.value()) {
+          this.seenModel = want;
+          this.explainModel.input.set_value(want);
+        }
         this.busy = null;
         if (this.docked && !this.dockedOpen) {
           const hit = this.list().find((x) => keyOf(x) === this.docked);
@@ -201,7 +212,7 @@ export default class Prs {
 
   /** An explanation or a quiz (bin/cockpit-explain.py), detached: it keeps going when you leave the page, and any copy of the page
    *  sees it through its marker file. */
-  startJob(cx, kind, p, model = this.jobModel()) {
+  startJob(cx, kind, p, model = this.jobModel(), extra = []) {
     const map = kind === "quiz" ? this.quiz : this.explain;
     map.set(keyOf(p), "loading");
     this.jobs.set(`${kind}:${keyOf(p)}`, { kind, p, model, at: Date.now() });
@@ -209,7 +220,7 @@ export default class Prs {
     cx.spawn(async () => {
       const { home } = await hub.install();
       const q = (x) => `'${String(x).replace(/'/g, "'\\''")}'`;
-      await exec("sh", ["-c", `nohup python3 ${q(`${home}/.local/share/cockpit/herdr/helpers/cockpit-explain.py`)} ${kind === "quiz" ? "quiz" : "pr"} ${q(p.repo)} ${p.number} ${q(model)} >/dev/null 2>&1 &`]).catch(() => {});
+      await exec("sh", ["-c", `nohup python3 ${q(`${home}/.local/share/cockpit/herdr/helpers/cockpit-explain.py`)} ${kind === "quiz" ? "quiz" : "pr"} ${q(p.repo)} ${p.number} ${q(model)} ${extra.map(q).join(" ")} >/dev/null 2>&1 &`]).catch(() => {});
     });
   }
 
@@ -245,11 +256,12 @@ export default class Prs {
   /** Without being asked: an explanation for the pull request you open, and an explanation and a quiz for every one with a
    *  review draft whose agent has finished (explain.auto in the cockpit config, on unless false). Two at a time. */
   autoJobs(cx, opened = null) {
-    if (this.docked || this.cfg?.explain?.auto === false) return;
+    const ex = this.cfg?.explain ?? {};
+    if (this.docked || (ex.auto === false && ex.auto_quiz === false)) return;
     cx.spawn(async (cx) => {
       const { home } = await hub.install();
       const have = async (dir) => new Set(((await exec("ls", [`${home}/.cache/cockpit/${dir}`]).catch(() => ({ stdout: "" }))).stdout ?? "").split("\n"));
-      const [ex, qz] = [await have("explain"), await have("quiz")];
+      const [exp, qz] = [await have("explain"), await have("quiz")];
       const name = (p) => `${p.repo.replace("/", "__")}__${p.number}.json`;
       const busy = () => this.jobs.size >= 2;
       const working = this.agentsOn();
@@ -262,10 +274,11 @@ export default class Prs {
       }
       for (const [kind, p] of want) {
         if (busy()) break;
-        const set = kind === "quiz" ? qz : ex;
+        if ((kind === "quiz" && ex.auto_quiz === false) || (kind === "explain" && ex.auto === false)) continue;
+        const set = kind === "quiz" ? qz : exp;
         const map = kind === "quiz" ? this.quiz : this.explain;
         if (set.has(name(p)) || set.has(`${name(p)}.running`) || set.has(`${name(p)}.error`) || this.jobs.has(`${kind}:${keyOf(p)}`) || map.get(keyOf(p)) === "loading") continue;
-        this.startJob(cx, kind, p);
+        this.startJob(cx, kind, p, ex.model ?? "agy/gemini-3.8-flash-medium");
       }
     });
   }
@@ -283,6 +296,7 @@ export default class Prs {
     this.drafts.load(cx, p).then((c) => c && cx.notify());
     this.loadQuiz(cx, p);
     this.autoJobs(cx, p);
+    this.drafts.pending(cx, p, "status");
     if (p.role === "author" && (p.behind ?? 0) > 0) this.checkMerge(cx, p);
     const url = p.ci?.builds?.[0];
     if (url && !this.ci.has(url)) {
@@ -683,6 +697,33 @@ export default class Prs {
     this.startJob(cx, "quiz", p);
   }
 
+  /** Quiz again: the same questions with the choices shuffled and your answers cleared, or new ones on what you missed. */
+  retake(cx, p, how) {
+    const d = this.quiz.get(keyOf(p));
+    if (!d?.questions) return;
+    if (how === "missed") {
+      const missed = d.questions.filter((q, i) => d.answers?.[i] != null && d.answers[i] !== q.answer).map((q) => q.question);
+      cx.spawn(async (cx) => {
+        const file = `/tmp/cockpit-quiz-missed-${p.repo.replace("/", "__")}-${p.number}.json`;
+        await writeTextFile(file, JSON.stringify(missed), await readTextFile(file).catch(() => null)).catch(() => {});
+        this.startJob(cx, "quiz", p, this.jobModel(), ["--missed", file]);
+      });
+      return;
+    }
+    for (const q of d.questions) {
+      const order = q.choices.map((_, i) => i).sort(() => Math.random() - 0.5);
+      q.answer = order.indexOf(q.answer);
+      q.choices = order.map((i) => q.choices[i]);
+    }
+    d.answers = {};
+    cx.notify();
+    cx.spawn(async () => {
+      const { home } = await hub.install();
+      const file = `${home}/.cache/cockpit/quiz/${p.repo.replace("/", "__")}__${p.number}.json`;
+      await writeTextFile(file, JSON.stringify(d), await readTextFile(file).catch(() => null)).catch(() => {});
+    });
+  }
+
   writeExplain(cx, p) {
     this.startJob(cx, "explain", p);
   }
@@ -720,6 +761,7 @@ export default class Prs {
         .when(ready && x.head !== p.head, (e) => e.child(Badge("written for an older head", "warning")))
         .when(Boolean(sc), (e) => e.child(Badge(`${sc.right}/${sc.total} right${sc.answered < sc.total ? ` · ${sc.total - sc.answered} to go` : ""}`, sc.answered < sc.total ? "secondary" : sc.right / sc.total >= 0.75 ? "success" : "warning"))))
       .child(div().text_size(TEXT.xs).text_color(k.mutedFg).child("Before your name goes on the review: what the change does, how it behaves, and whether the agent's comments hold up. Answer first; the why shows after."))
+      .when(Boolean(ready), (e) => e.child(h_flex().gap(6).items_center().child(Badge(`${{ basics: "Basics", standard: "Standard", deep: "Deep" }[x.difficulty] ?? "Standard"} · ${x.questions.length} questions`, "secondary")).when(Boolean(x.focus), (y) => y.child(Badge("on what you missed", "info"))).child(Button("prs-quiz-settings", { label: "Difficulty and length…", size: "sm", variant: "ghost", tooltip: "In Cockpit settings: AI", onClick: () => openSettings("ai") }))))
       .child(h_flex().gap(8).items_start().child(div().flex_1().min_w(0).child(this.explainModel.element(k, "quiz"))).child(Button("prs-quiz-go", { label: x === "loading" ? "Writing…" : ready ? "New quiz" : "Write the quiz", icon: "sparkles", size: "sm", disabled: x === "loading" || !this.explainModel.value(), tooltip: this.explainModel.value() ? undefined : "Pick a model first", onClick: (_e, cx) => this.writeQuiz(cx, p) })));
     if (!x) return v_flex().gap(12).child(head);
     if (x === "loading") return v_flex().gap(12).child(head).child(h_flex().h(120).justify_center().items_center().gap(8).text_color(k.mutedFg).child(Spinner({ size: 14 })).child(`${this.explainModel.value()} is reading the diff and the draft…`));
@@ -754,7 +796,19 @@ export default class Prs {
             .when(done, (e) => e.child(v_flex().gap(4).p(10).rounded(RADIUS.md).border_l_2().border_color(got === q.answer ? k.success : k.destructive).bg(alpha(k.info, 0.05)).child(div().text_size(TEXT.xs).font_semibold().text_color(got === q.answer ? k.success : k.destructive).child(got === q.answer ? "Right" : "Not quite")).child(TextView.markdown(`qz-x-${keyOf(p)}-${i}`, q.explain ?? "").selectable(true).w_full())));
         }),
       )
-      .when(Boolean(sc) && sc.answered === sc.total, (e) => e.child(h_flex().gap(10).p(14).items_center().rounded(RADIUS.lg).bg(alpha(sc.right / sc.total >= 0.75 ? k.success : k.warning, 0.1)).child(div().flex_1().text_size(TEXT.sm).child(sc.right / sc.total >= 0.75 ? `${sc.right} of ${sc.total}: you know this change.` : `${sc.right} of ${sc.total}: worth another look before posting: Explain and Files changed have the parts you missed.`)).child(Button("prs-quiz-back", { label: "Back to the review", size: "sm", variant: "outline", onClick: (_e, cx) => ((this.view = null), cx.notify()) }))));
+      .when(Boolean(sc) && sc.answered > 0, (e) => {
+        const done = sc.answered === sc.total, good = sc.right / sc.total >= 0.75, wrong = sc.answered - sc.right;
+        return e.child(
+          v_flex().gap(10).p(14).rounded(RADIUS.lg).bg(alpha(!done ? k.muted : good ? k.success : k.warning, done ? 0.1 : 0.5))
+            .child(div().text_size(TEXT.sm).child(!done ? `${sc.answered} of ${sc.total} answered so far, ${sc.right} right.` : good ? `${sc.right} of ${sc.total}: you know this change.` : `${sc.right} of ${sc.total}: worth another look before posting. Explain and Files changed have the parts you missed.`))
+            .child(h_flex().gap(8).flex_wrap().items_center()
+              .child(Button("prs-quiz-retake", { label: "Quiz again", icon: "rotate-ccw", size: "sm", variant: "outline", tooltip: "The same questions, choices shuffled, your answers cleared", onClick: (_e, cx) => this.retake(cx, p, "same") }))
+              .when(wrong > 0, (x) => x.child(Button("prs-quiz-missed", { label: `New questions on what I missed · ${wrong}`, icon: "sparkles", size: "sm", variant: "outline", tooltip: "New questions on the same parts of the code, asked another way", onClick: (_e, cx) => this.retake(cx, p, "missed") })))
+              .child(Button("prs-quiz-new", { label: "New questions", icon: "sparkles", size: "sm", variant: "ghost", onClick: (_e, cx) => this.writeQuiz(cx, p) }))
+              .child(div().flex_1())
+              .child(Button("prs-quiz-back", { label: "Back to the review", size: "sm", variant: done ? "default" : "ghost", onClick: (_e, cx) => ((this.view = null), cx.notify()) }))),
+        );
+      })
   }
 
   detail(k, p, cx) {
@@ -889,6 +943,14 @@ export default class Prs {
       this.scopeAt = sc.at;
       this.scope = sc.scope;
       this.repoF = null;
+    }
+    // As a pane: its pull request, as soon as the list has it (once; Back still reaches the list).
+    if (this.docked && !this.dockedOpen) {
+      const hit = list.find((p) => keyOf(p) === this.docked);
+      if (hit) {
+        this.dockedOpen = true;
+        cx.timer.after(1, (cx) => this.select(cx, hit));
+      }
     }
     const want = this.docked ? null : shared("cockpit.prs.focus");
     if (!want) this.focused = null;
@@ -1049,7 +1111,7 @@ export default class Prs {
         return e.child(
           AlertDialog("prs-post", {
             title: this.drafts.confirm.pending ? `Keep the draft on GitHub as pending on ${dp.repo.split("/")[1]}#${dp.number}?` : `Post ${verb} on ${dp.repo.split("/")[1]}#${dp.number}?`,
-            description: this.drafts.confirm.pending ? `${n.lines} line comment${n.lines === 1 ? "" : "s"} are saved on GitHub as a pending review. Only you see it, in VS Code's pull request view and on the PR page, until you submit it. Nothing is published.` : `${n.lines} line comment${n.lines === 1 ? "" : "s"} and ${n.replies} repl${n.replies === 1 ? "y" : "ies"} go to GitHub under your name, visible to everyone on the pull request.${quizNote}`,
+            description: this.drafts.confirm.pending ? `${n.lines} line comment${n.lines === 1 ? "" : "s"} are saved on GitHub as a pending review. Only you see it, in VS Code's pull request view and on the PR page, until you submit it. Nothing is published.` : `${n.lines} line comment${n.lines === 1 ? "" : "s"} and ${n.replies} repl${n.replies === 1 ? "y" : "ies"} go to GitHub under your name, visible to everyone on the pull request.${this.drafts.sync.get(keyOf(dp))?.on ? " Your pending review is brought up to date and submitted." : ""}${quizNote}`,
             confirmLabel: this.drafts.confirm.pending ? "Keep as pending" : "Post review",
             onCancel: (_e, cx) => ((this.drafts.confirm = null), cx.notify()),
             onConfirm: (_e, cx) => this.drafts.post(cx, dp, (cx) => this.readConvo(cx, dp), Boolean(this.drafts.confirm.pending)),
