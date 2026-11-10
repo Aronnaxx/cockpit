@@ -9,6 +9,7 @@ import * as hub from "./hub.js";
 import { tokens, alpha, TEXT, RADIUS, Badge, Button, Empty, Mono, Spinner, Tabs } from "./ui.js";
 import { CodeBlock, DiffBlock, makeCode, LINE } from "./codeblock.js";
 import { openFileAt, githubFileUrl } from "./editors.js";
+import { parseRange } from "./prreview.js";
 import { repoFolder } from "./agentlaunch.js";
 
 const keyOf = (p) => `${p.repo}#${p.number}`;
@@ -146,8 +147,6 @@ export class PrFiles {
       .id("pf-list")
       .w(320)
       .flex_none()
-      .min_h(0)
-      .overflow_y_scrollbar()
       .gap(2)
       .children(
         files.map((f) => {
@@ -186,12 +185,12 @@ export class PrFiles {
         const changed = new Set();
         for (const h of parsePatch(file.patch)) for (const r of h.rows) if (r.t === "+") changed.add(r.new);
         const rows = Array.from({ length: fl.lines }, (_, i) => ({ t: changed.has(i + 1) ? "+" : " ", old: null, new: i + 1 }));
-        body = DiffBlock(`pf-full-${file.path}`, fl.code, rows, { onLine: addAt(file.path), marked: new Set(pending(file.path).map((r) => Number(r.line.value()))) });
+        body = DiffBlock(`pf-full-${file.path}`, fl.code, rows, { onLine: addAt(file.path), marked: new Set(pending(file.path).flatMap((r) => { const g = parseRange(r.line.value()); return g ? Array.from({ length: g.end - g.start + 1 }, (_, i) => g.start + i) : []; })) });
       }
     } else {
       const built = this.built.get(`${keyOf(p)}:${file.path}`) ?? [];
       body = built.length
-        ? v_flex().gap(8).children(built.flatMap(({ hunk, code }, i) => [h_flex().id(`pf-h-${i}`).gap(8).items_center().px(8).py(2).rounded(RADIUS.sm).bg(alpha(k.info, 0.1)).child(div().flex_1().min_w(0).truncate().text_size(TEXT.xs).font_family("JetBrains Mono").text_color(k.info).child(hunk.header)).child(Button(`pf-hv-${i}`, { label: "VS Code", size: "sm", variant: "ghost", tooltip: "This hunk in VS Code, in the PR's worktree", onClick: (_e, cx) => this.inEditor(cx, p, cfg, file.path, hunk.rows.find((r) => r.new)?.new ?? 1) })).child(Button(`pf-hg-${i}`, { label: "GitHub", size: "sm", variant: "ghost", tooltip: "This hunk on GitHub", onClick: (_e, cx) => this.onGithub(cx, p, file.path, hunk.rows.find((r) => r.new)?.new ?? null) })), DiffBlock(`pf-d-${file.path}-${i}`, code, hunk.rows, { onLine: addAt(file.path), marked: new Set(pending(file.path).map((r) => Number(r.line.value()))) })]))
+        ? v_flex().gap(8).children(built.flatMap(({ hunk, code }, i) => [h_flex().id(`pf-h-${i}`).gap(8).items_center().px(8).py(2).rounded(RADIUS.sm).bg(alpha(k.info, 0.1)).child(div().flex_1().min_w(0).truncate().text_size(TEXT.xs).font_family("JetBrains Mono").text_color(k.info).child(hunk.header)).child(Button(`pf-hv-${i}`, { label: "VS Code", size: "sm", variant: "ghost", tooltip: "This hunk in VS Code, in the PR's worktree", onClick: (_e, cx) => this.inEditor(cx, p, cfg, file.path, hunk.rows.find((r) => r.new)?.new ?? 1) })).child(Button(`pf-hg-${i}`, { label: "GitHub", size: "sm", variant: "ghost", tooltip: "This hunk on GitHub", onClick: (_e, cx) => this.onGithub(cx, p, file.path, hunk.rows.find((r) => r.new)?.new ?? null) })), DiffBlock(`pf-d-${file.path}-${i}`, code, hunk.rows, { onLine: addAt(file.path), marked: new Set(pending(file.path).flatMap((r) => { const g = parseRange(r.line.value()); return g ? Array.from({ length: g.end - g.start + 1 }, (_, i) => g.start + i) : []; })) })]))
         : div().text_size(TEXT.sm).text_color(k.dim).child(`${file.status === "renamed" ? "Renamed" : "No text diff"} (a binary file, or one too large to show here). Use “Full file”.`);
     }
     const mine = file ? pending(file.path) : [];
@@ -216,7 +215,7 @@ export class PrFiles {
           )
           .child(div().text_size(TEXT.xs).text_color(k.dim).child("Click a line's number to comment on it. Comments go into your review draft; nothing is posted until you post it."))
           .child(body)
-          .children(mine.length ? [div().text_size(TEXT.sm).font_semibold().child(`Your comments on this file · ${mine.length}`), ...mine.map((r) => v_flex().id(`pf-c-${r.id}`).gap(6).p(10).rounded(RADIUS.md).border_1().border_color(alpha(k.warning, 0.5)).bg(k.card).child(h_flex().gap(8).items_center().child(Mono(`line ${r.line.value() || "?"}`, { size: TEXT.xs, color: k.foreground })).child(div().flex_1()).child(Button(`pf-vs-${r.id}`, { label: "VS Code", size: "sm", variant: "ghost", onClick: (_e, cx) => this.inEditor(cx, p, cfg, file.path, Number(r.line.value()) || 1) })).child(Button(`pf-gh-${r.id}`, { label: "GitHub", size: "sm", variant: "ghost", onClick: (_e, cx) => this.onGithub(cx, p, file.path, Number(r.line.value()) || null) })).child(Button(`pf-rm-${r.id}`, { label: "Remove", size: "sm", variant: "ghost", onClick: (_e, cx) => drafts.removeRow(cx, p, r) }))).child(drafts.box(k, r.body)))] : []),
+          .children(mine.length ? [div().text_size(TEXT.sm).font_semibold().child(`Your comments on this file · ${mine.length}`), ...mine.map((r) => v_flex().id(`pf-c-${r.id}`).gap(6).p(10).rounded(RADIUS.md).border_1().border_color(alpha(k.warning, 0.5)).bg(k.card).child(h_flex().gap(8).items_center().child(Mono(`line ${r.line.value() || "?"}`, { size: TEXT.xs, color: k.foreground })).child(div().flex_1()).child(Button(`pf-vs-${r.id}`, { label: "VS Code", size: "sm", variant: "ghost", onClick: (_e, cx) => this.inEditor(cx, p, cfg, file.path, (parseRange(r.line.value())?.start ?? 1)) })).child(Button(`pf-gh-${r.id}`, { label: "GitHub", size: "sm", variant: "ghost", onClick: (_e, cx) => this.onGithub(cx, p, file.path, (parseRange(r.line.value())?.end ?? null)) })).child(Button(`pf-rm-${r.id}`, { label: "Remove", size: "sm", variant: "ghost", onClick: (_e, cx) => drafts.removeRow(cx, p, r) }))).child(drafts.box(k, r.body)))] : []),
       );
   }
 }

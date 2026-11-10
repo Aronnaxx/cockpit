@@ -7,10 +7,18 @@ import { h_flex, v_flex, InputState, TextareaState, Textarea, Input, TextView } 
 import { exec, notify, readTextFile, writeTextFile } from "herdr";
 import * as hub from "./hub.js";
 import { tokens, alpha, TEXT, RADIUS, Badge, Button, Tabs, Mono } from "./ui.js";
-import { CodeBlock, makeCode } from "./codeblock.js";
+import { CodeRows } from "./codeblock.js";
 
 const keyOf = (p) => `${p.repo}#${p.number}`;
 export const draftFile = (home, p) => `${home}/.cache/cockpit/review-drafts/${p.repo.replace("/", "__")}__${p.number}.json`;
+/** A line field's text as a range: "12" or "12-18" (also "12:18"): {start, end}; null when it is not a line. */
+export function parseRange(text) {
+  const m = String(text ?? "").trim().match(/^(\d+)(?:\s*[-–:]\s*(\d+))?$/);
+  if (!m) return null;
+  const a = Number(m[1]), b = m[2] ? Number(m[2]) : a;
+  return { start: Math.min(a, b), end: Math.max(a, b) };
+}
+
 const VERDICTS = [["COMMENT", "Comment"], ["APPROVE", "Approve"], ["REQUEST_CHANGES", "Request changes"]];
 
 export class Drafts {
@@ -23,7 +31,6 @@ export class Drafts {
     // The pull request's files at its head (for the lines a comment is about): `repo#n:path` -> lines, or "loading".
     this.files = new Map();
     // The highlighted lines of a comment: `repo#n:path:line` -> a code view (made in tasks, never in render).
-    this.cbs = new Map();
   }
 
   /** Reads the draft file; true when what it shows changed (an agent wrote it, or the first read). */
@@ -51,7 +58,6 @@ export class Drafts {
     entry.summary = this.area(d.summary ?? "", "The review's summary: what you'd say when you submit it", 3, changed);
     entry.rows = (d.comments ?? []).map((c) => this.row(c, changed));
     for (const c of d.comments ?? []) if (c.path) this.ensureFile(cx, p, c.path);
-    cx.timer.after(1, () => this.buildSnippets());
     this.m.set(keyOf(p), entry);
     return true;
   }
@@ -74,7 +80,6 @@ export class Drafts {
         const { home } = await hub.install();
         const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-pr-file.py`, p.repo, String(p.number), path], { timeout: 90000 });
         this.files.set(key, JSON.parse(r.stdout || "{}").files?.[path] ?? null);
-        this.buildSnippets();
       } catch {
         this.files.set(key, null);
       }
@@ -82,32 +87,15 @@ export class Drafts {
     });
   }
 
-  /** Makes the highlighted view for every draft comment whose file is read and whose lines have none yet. */
-  buildSnippets() {
-    for (const e of this.m.values()) {
-      if (!e.exists) continue;
-      for (const r of e.rows) {
-        const path = r.path.value().trim(), n = Number(r.line.value());
-        const lines = this.files.get(`${keyOf(e.p)}:${path}`);
-        const key = `${keyOf(e.p)}:${path}:${n}`;
-        if (r.reply_to || !Array.isArray(lines) || !n || n > lines.length || this.cbs.has(key)) continue;
-        const from = Math.max(1, n - 3), to = Math.min(lines.length, n + 3);
-        try {
-          this.cbs.set(key, { cb: makeCode(lines.slice(from - 1, to), path), from, to, n });
-        } catch {
-          this.cbs.set(key, null);
-        }
-      }
-    }
-  }
-
-  /** The lines a comment is on, with the line numbers, the commented one marked; nothing until the file is read. */
+  /** The lines a comment is on (three around it), with the line numbers and the commented one tinted; nothing until the file is read. */
   snippet(k, p, path, line) {
-    const v = this.cbs.get(`${keyOf(p)}:${path}:${Number(line)}`);
-    if (!v) return null;
-    const gutter = [];
-    for (let i = v.from; i <= v.to; i++) gutter.push(String(i));
-    return CodeBlock(`sn-${path}-${v.n}`, v.cb, { gutter, marks: { [v.n - v.from]: k.warning } });
+    const lines = this.files.get(`${keyOf(p)}:${path}`);
+    const r = parseRange(line);
+    if (!Array.isArray(lines) || !r || r.end > lines.length) return null;
+    const from = Math.max(1, r.start - 3), to = Math.min(lines.length, r.end + 3);
+    const rows = [];
+    for (let i = from; i <= to; i++) rows.push({ num: i, text: lines[i - 1], mark: i >= r.start && i <= r.end ? k.warning : null });
+    return CodeRows(`sn-${path}-${r.start}-${r.end}`, rows, path);
   }
 
   md(id, text) {
@@ -123,7 +111,7 @@ export class Drafts {
 
   row(c, onChange) {
     const path = InputState.new({ placeholder: "path/to/file", value: c.path ?? "" });
-    const line = InputState.new({ placeholder: "line", value: c.line ? String(c.line) : "" });
+    const line = InputState.new({ placeholder: "line", value: c.line ? (c.start_line && c.start_line < c.line ? `${c.start_line}-${c.line}` : String(c.line)) : "" });
     path.on("change", () => onChange());
     line.on("change", () => onChange());
     return { id: `r${++this.n}`, reply_to: c.reply_to ?? null, quote: c.quote ?? null, path, line, body: this.area(c.body ?? "", c.reply_to ? "Your reply" : "Your comment on that line", 2, onChange) };
@@ -133,7 +121,7 @@ export class Drafts {
     return {
       summary: e.summary.value(),
       verdict: e.verdict,
-      comments: e.rows.map((r) => ({ ...(r.reply_to ? { reply_to: r.reply_to, quote: r.quote } : { path: r.path.value().trim(), line: Number(r.line.value()) || null }), body: r.body.value() })),
+      comments: e.rows.map((r) => ({ ...(r.reply_to ? { reply_to: r.reply_to, quote: r.quote } : { path: r.path.value().trim(), ...(parseRange(r.line.value()) ? { line: parseRange(r.line.value()).end, ...(parseRange(r.line.value()).start < parseRange(r.line.value()).end ? { start_line: parseRange(r.line.value()).start } : {}) } : { line: null }) }), body: r.body.value() })),
     };
   }
 
@@ -145,7 +133,6 @@ export class Drafts {
     cx.timer.after(500, () => {
       if (e.version !== mine) return;
       for (const r of e.rows) { const path = r.path.value().trim(); if (path && !r.reply_to) this.ensureFile(cx, e.p, path); }
-      this.buildSnippets();
       e.chain = e.chain.then(() => this.save(e)).catch(() => {});
     });
   }

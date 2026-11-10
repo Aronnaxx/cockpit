@@ -18,6 +18,14 @@ def gh(*args, data=None):
     return subprocess.run(["gh", *args], input=data, capture_output=True, text=True, timeout=120)
 
 
+def one(c):
+    """A line comment, over a range of lines when it has a start_line."""
+    out = {"path": c["path"], "line": int(c["line"]), "side": "RIGHT", "body": c["body"]}
+    if c.get("start_line") and int(c["start_line"]) < int(c["line"]):
+        out.update(start_line=int(c["start_line"]), start_side="RIGHT")
+    return out
+
+
 def main():
     if len(sys.argv) < 4:
         print(__doc__.strip(), file=sys.stderr)
@@ -36,7 +44,7 @@ def main():
         return 0
     head = gh("api", f"repos/{slug}/pulls/{number}", "--jq", ".head.sha").stdout.strip()
     payload = {"commit_id": head, "event": verdict, "body": summary,
-               "comments": [{"path": c["path"], "line": int(c["line"]), "side": "RIGHT", "body": c["body"]} for c in lines]}
+               "comments": [one(c) for c in lines]}
     if pending:
         # A pending review: only you see it (GitHub's own draft; VS Code's pull request extension lists it as pending) until you submit it.
         del payload["event"]
