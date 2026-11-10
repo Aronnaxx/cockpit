@@ -4,7 +4,7 @@
 // which model, which preset, what task. Nothing is ever posted to GitHub from here. Data: prsdata.js.
 
 import { div } from "gpui-kit";
-import { h_flex, v_flex, InputState } from "gpui-base";
+import { h_flex, v_flex, InputState, TextView } from "gpui-base";
 import { exec, notify, run, shared } from "herdr";
 import * as hub from "./hub.js";
 import { tokens, alpha, TEXT, RADIUS, Badge, Button, Card, PageHeader, Empty, Mono, Progress, Spinner, TextField, Tabs, Chip, AlertDialog, openMenu } from "./ui.js";
@@ -20,10 +20,26 @@ const TASKS = {
   reviewer: [["review", "Review it"], ["rereview", "Re-review (only what changed)"]],
 };
 
+// id, app name (macOS), label: what "Open in…" offers when it is installed.
+const EDITORS = [["vscode", "Visual Studio Code", "VS Code"], ["zed", "Zed", "Zed"], ["antigravity", "Antigravity", "Antigravity"], ["antigravity-ide", "Antigravity IDE", "Antigravity IDE"], ["cursor", "Cursor", "Cursor"], ["windsurf", "Windsurf", "Windsurf"]];
+
 export default class Prs {
   init(_p, cx) {
     this.sel = null;
-    this.scope = "mine";
+    this.scope = "review";
+    this.scopeAt = null;
+    this.q = InputState.new({ placeholder: "Filter: a repo, a title, a person…" });
+    this.q.on("change", (_e, cx) => cx.notify());
+    // The editors installed here, for "Open in…".
+    this.editors = [];
+    cx.spawn(async (cx) => {
+      try {
+        const r = await exec("sh", ["-c", "ls /Applications ~/Applications 2>/dev/null"], { timeout: 10000 });
+        const have = new Set(String(r.stdout).split("\n").map((n) => n.replace(/\.app$/, "")));
+        this.editors = EDITORS.filter(([, app]) => have.has(app));
+      } catch {}
+      cx.notify();
+    });
     this.repoF = null;
     this.ci = new Map();
     this.cfg = {};
@@ -76,7 +92,8 @@ export default class Prs {
     const m = c.match(/^prs:([a-z]+):([a-z-]+):(.+)$/);
     if (!m) return;
     const p = this.list().find((x) => keyOf(x) === m[3]);
-    if (p) this.start(cx, p, m[1], m[2]);
+    if (p && m[1] === "openin") this.openIn(cx, p, m[2]);
+    else if (p) this.start(cx, p, m[1], m[2]);
   }
 
   list() {
@@ -152,6 +169,27 @@ export default class Prs {
     });
   }
 
+  /** The pull request's worktree (made or brought up to date), opened in an editor. */
+  openIn(cx, p, id) {
+    const app = EDITORS.find(([e]) => e === id)?.[1];
+    if (!app) return;
+    cx.spawn(async (cx) => {
+      try {
+        const { home } = await hub.install();
+        const folder = repoFolder(p.repo, this.cfg).replace(/^~/, home);
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-worktree.py`, p.repo, String(p.number), folder], { timeout: 400000 });
+        const d = JSON.parse(r.stdout || "{}");
+        if (d.error) return notify({ title: "No worktree", body: d.error });
+        this.worktrees.add(keyOf(p));
+        await exec("open", ["-a", app, d.path], { timeout: 20000 });
+        notify({ title: `Opened in ${app}`, body: d.path });
+      } catch (e) {
+        notify({ title: "Could not open it", body: String(e?.message ?? e).slice(0, 160) });
+      }
+      cx.notify();
+    });
+  }
+
   readCi(cx, url, retry = false) {
     cx.spawn(async (cx) => {
       try {
@@ -188,7 +226,8 @@ export default class Prs {
     const c = this.convo.get(keyOf(p));
     const head = (author, what, at, extra) =>
       h_flex().gap(8).items_center().child(div().size(20).flex_none().rounded(10).flex().items_center().justify_center().bg(alpha(k.info, 0.18)).text_size(10).font_semibold().text_color(k.info).child(author.slice(0, 2).toUpperCase())).child(div().text_size(TEXT.sm).font_semibold().text_color(k.foreground).child(author)).child(div().text_size(TEXT.xs).text_color(k.dim).child(`${what} ${ago(at)} ago`)).child(div().flex_1()).children([extra].filter(Boolean));
-    const body = (text) => (text ? div().text_size(TEXT.sm).text_color(k.foreground).whitespace_normal().child(text.length > 1600 ? `${text.slice(0, 1600)}…` : text) : div());
+    let mdn = 0;
+    const body = (text) => (text ? TextView.markdown(`cv-md-${keyOf(p)}-${++mdn}`, text.length > 1600 ? `${text.slice(0, 1600)}…` : text).selectable(true).w_full() : div());
     const chip = (label, color) => div().flex_none().px(6).h(16).flex().items_center().rounded(4).text_size(10).bg(alpha(color, 0.14)).text_color(color).child(label);
     if (!c || c === "loading") return h_flex().gap(8).items_center().text_color(k.mutedFg).child(Spinner({ size: 12 })).child("Reading the conversation…");
     const items = (c.items ?? []).map((it, i) => {
@@ -329,6 +368,7 @@ export default class Prs {
               .gap(6)
               .pt(4)
               .child(Button("prs-open", { label: "Open PR", icon: "external", size: "sm", variant: "outline", onClick: (_e, cx) => cx.spawn(async () => hub.openUrl(p.url)) }))
+              .when(this.editors.length > 0, (e) => e.child(Button("prs-openin", { label: "Open in…", icon: "folder", size: "sm", variant: "outline", tooltip: "The pull request's worktree, in an editor", onClick: () => openMenu(this.editors.map(([id, , label]) => ({ label, icon: "code", command: `prs:openin:${id}:${keyOf(p)}` })), { width: 200 }) })))
               .child(Button("prs-worktree", { label: this.worktrees.has(keyOf(p)) ? "Open worktree" : "Explore in a worktree", icon: "git-branch", size: "sm", variant: "outline", tooltip: "A git worktree of this pull request's head in ~/worktrees, opened in a new tab; your own checkout is not touched", onClick: (_e, cx) => this.worktree(cx, p) }))
               .when(this.worktrees.has(keyOf(p)), (e) => e.child(Button("prs-worktree-rm", { label: "Remove worktree", size: "sm", variant: "ghost", onClick: (_e, cx) => this.worktree(cx, p, true) })))
               .when(p.role === "author", (e) =>
@@ -425,7 +465,14 @@ export default class Prs {
         : null;
     const order = (a, b) => (urgency(b) - urgency(a)) || (b.turn?.who === "you") - (a.turn?.who === "you") || b.last_activity - a.last_activity;
     // Home's "Details" leaves the pull request to open in this shared value.
+    const sc = shared("cockpit.prs.scope");
+    if (sc && sc.at !== this.scopeAt) {
+      this.scopeAt = sc.at;
+      this.scope = sc.scope;
+      this.repoF = null;
+    }
     const want = shared("cockpit.prs.focus");
+    if (!want) this.focused = null;
     if (want && want !== this.focused) {
       this.focused = want;
       const hit = list.find((p) => keyOf(p) === want);
@@ -435,11 +482,17 @@ export default class Prs {
     const allTheirs = [...(d?.assigned ?? [])].filter((p) => p.turn?.who !== "none").sort(order);
     const repos = [...new Set([...allMine, ...allTheirs].map((p) => p.repo))].sort();
     const inRepo = (p) => !this.repoF || p.repo === this.repoF;
-    const mine = this.scope === "review" ? [] : allMine.filter(inRepo);
-    const theirs = this.scope === "mine" ? [] : allTheirs.filter(inRepo);
+    const needle = this.q.value().trim().toLowerCase();
+    const matches = (p) => !needle || `${p.repo} ${p.number} ${p.title} ${p.branch} ${p.author} ${(p.reviewers ?? []).map((r) => r.login).join(" ")}`.toLowerCase().includes(needle);
+    const mine = this.scope === "review" ? [] : allMine.filter(inRepo).filter(matches);
+    const theirs = this.scope === "mine" ? [] : allTheirs.filter(inRepo).filter(matches);
+    const youN = (this.scope === "mine" ? allMine : allTheirs).filter((p) => p.turn?.who === "you").length;
+    const summary = this.scope === "mine" ? `${youN} on you · ${allMine.length - youN} waiting` : `${youN} for you · ${allTheirs.length - youN} team`;
     const filters = v_flex()
       .gap(8)
-      .child(Tabs("prs-scope", { value: this.scope, onChange: (v, cx) => ((this.scope = v), cx.notify()), items: [{ value: "mine", label: "Yours", count: allMine.length }, { value: "review", label: "To review", count: allTheirs.length }] }))
+      .child(Tabs("prs-scope", { value: this.scope, onChange: (v, cx) => ((this.scope = v), cx.notify()), items: [{ value: "review", label: "To review", count: allTheirs.length }, { value: "mine", label: "Yours", count: allMine.length }] }))
+      .child(div().text_size(TEXT.xs).text_color(k.dim).child(summary))
+      .child(TextField(this.q, { active: false }))
       .child(h_flex().gap(6).flex_wrap().children([Chip("all repos", { id: "prs-repo-all", color: this.repoF ? undefined : k.ring, onClick: (_e, cx) => ((this.repoF = null), cx.notify()) }), ...repos.map((r) => Chip(r.split("/")[1], { id: `prs-repo-${r}`, color: this.repoF === r ? k.ring : undefined, onClick: (_e, cx) => ((this.repoF = this.repoF === r ? null : r), cx.notify()) }))]));
     const sel = list.find((p) => keyOf(p) === this.sel) ?? null;
     const yours = list.filter((p) => p.turn?.who === "you").length;

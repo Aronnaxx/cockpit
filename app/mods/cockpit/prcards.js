@@ -15,7 +15,7 @@ const WHY = { review: "REVIEW", "re-review": "RE-REVIEW", ci: "FIX CI", changes:
 /** What cannot wait on an author's own pull request, whoever's move it is: changes asked, CI failing. */
 export function urgent(p) {
   if (p.role !== "author") return null;
-  if (p.decision === "CHANGES_REQUESTED") return { label: "CHANGES ASKED", tone: "destructive" };
+  if (p.decision === "CHANGES_REQUESTED" && p.turn?.why !== "re-requested") return { label: "CHANGES ASKED", tone: "destructive" };
   if ((p.ci?.failed?.length ?? 0) > 0) return { label: "CI FAILING", tone: "destructive" };
   if ((p.behind ?? 0) > 0) return { label: p.behind >= 20 ? `${p.behind} BEHIND MAIN` : "BEHIND MAIN", tone: p.behind >= 20 ? "destructive" : "warning" };
   return null;
@@ -50,8 +50,16 @@ export function startFromHome(rest, list, cfg, cx) {
   });
 }
 
+/** The PRs tab, on its "Yours" or "To review" list. */
+export function openTab(scope, show) {
+  setShared("cockpit.prs.scope", { scope, at: Date.now() });
+  setShared("cockpit.prs.focus", null);
+  show("prs");
+}
+
 /** A pull request's page on the PRs tab. */
 export function openDetails(p, show) {
+  setShared("cockpit.prs.scope", { scope: p.role === "author" ? "mine" : "review", at: Date.now() });
   setShared("cockpit.prs.focus", prKey(p));
   show("prs");
 }
@@ -127,13 +135,11 @@ export function PrCard(p, { show, openUrl }) {
 export function PrSections(d, { narrow, show, openUrl }) {
   const k = tokens();
   const order = (a, b) => b.last_activity - a.last_activity;
-  const all = [...(d?.mine ?? []), ...(d?.assigned ?? [])];
   const critical = (d?.mine ?? []).filter((p) => urgency(p) === 2).sort(order);
-  const onYou = all.filter((p) => p.turn?.who === "you").length;
   const cols = narrow ? 1 : 2;
   const rows = [];
   for (let i = 0; i < critical.length; i += cols) rows.push(critical.slice(i, i + cols));
-  const open = Button("prs-open-tab", { label: `Open PRs · ${onYou} on you`, variant: "ghost", size: "sm", tooltip: "Every pull request: yours, to review, worktrees", onClick: () => show("prs") });
+  const open = Button("prs-open-tab", { label: "Open PR tab", variant: "ghost", size: "sm", tooltip: "Your pull requests and the ones to review", onClick: () => openTab("mine", show) });
   return v_flex()
     .gap(10)
     .child(StageHeading("head-your-prs", "Critical PRs", { color: k.destructive, count: critical.length, action: open }))

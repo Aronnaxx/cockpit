@@ -3,7 +3,7 @@
 // get, and only "Post review" (after a confirmation) sends it, through bin/cockpit-pr-review.py. Nothing else writes to GitHub.
 
 import { div } from "gpui-kit";
-import { h_flex, v_flex, InputState, TextareaState, Textarea, Input } from "gpui-base";
+import { h_flex, v_flex, InputState, TextareaState, Textarea, Input, TextView } from "gpui-base";
 import { exec, notify, readTextFile, writeTextFile } from "herdr";
 import * as hub from "./hub.js";
 import { tokens, alpha, TEXT, RADIUS, Badge, Button, Tabs, Mono } from "./ui.js";
@@ -19,6 +19,8 @@ export class Drafts {
     this.confirm = null;
     this.busy = null;
     this.n = 0;
+    // The pull request's files at its head (for the lines a comment is about): `repo#n:path` -> lines, or "loading".
+    this.files = new Map();
   }
 
   /** Reads the draft file; true when what it shows changed (an agent wrote it, or the first read). */
@@ -39,8 +41,42 @@ export class Drafts {
     const changed = () => this.queueSave(cx, entry);
     entry.summary = this.area(d.summary ?? "", "The review's summary: what you'd say when you submit it", 3, changed);
     entry.rows = (d.comments ?? []).map((c) => this.row(c, changed));
+    for (const c of d.comments ?? []) if (c.path) this.ensureFile(cx, p, c.path);
     this.m.set(keyOf(p), entry);
     return true;
+  }
+
+  /** Reads a file of the pull request once, for the lines shown under a comment. */
+  ensureFile(cx, p, path) {
+    const key = `${keyOf(p)}:${path}`;
+    if (!path || this.files.has(key)) return;
+    this.files.set(key, "loading");
+    cx.spawn(async (cx) => {
+      try {
+        const { home } = await hub.install();
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-pr-file.py`, p.repo, String(p.number), path], { timeout: 90000 });
+        this.files.set(key, JSON.parse(r.stdout || "{}").files?.[path] ?? null);
+      } catch {
+        this.files.set(key, null);
+      }
+      cx.notify();
+    });
+  }
+
+  /** The lines a comment is on, with the line numbers, the commented one marked; nothing until the file is read. */
+  snippet(k, p, path, line) {
+    const lines = this.files.get(`${keyOf(p)}:${path}`);
+    const n = Number(line);
+    if (!Array.isArray(lines) || !n || n > lines.length) return null;
+    const from = Math.max(1, n - 3), to = Math.min(lines.length, n + 3);
+    const rows = [];
+    for (let i = from; i <= to; i++)
+      rows.push(h_flex().id(`sn-${path}-${i}`).gap(10).px(8).bg(i === n ? alpha(k.warning, 0.18) : alpha(k.muted, 0)).child(div().w(36).flex_none().text_right().text_size(10.5).font_family("JetBrains Mono").text_color(k.dim).child(String(i))).child(div().text_size(10.5).font_family("JetBrains Mono").whitespace_nowrap().text_color(i === n ? k.foreground : k.mutedFg).child(lines[i - 1] || " ")));
+    return v_flex().w_full().py(4).rounded(RADIUS.sm).bg(alpha(k.muted, 0.7)).overflow_x_scrollbar().children(rows);
+  }
+
+  md(id, text) {
+    return TextView.markdown(id, text).selectable(true).w_full();
   }
 
   area(value, placeholder, rows, onChange) {
@@ -72,6 +108,7 @@ export class Drafts {
     const mine = e.version;
     cx.timer.after(500, () => {
       if (e.version !== mine) return;
+      for (const r of e.rows) { const path = r.path.value().trim(); if (path && !r.reply_to) this.ensureFile(cx, e.p, path); }
       e.chain = e.chain.then(() => this.save(e)).catch(() => {});
     });
   }
@@ -187,11 +224,12 @@ export class Drafts {
         div().text_size(TEXT.xs).text_color(k.dim).child("This is what GitHub will get. Nothing is sent until you post it."),
         v_flex().gap(8).p(12).rounded(RADIUS.md).border_1().border_color(k.border).bg(k.card)
           .child(h_flex().gap(8).items_center().child(div().text_size(TEXT.sm).font_semibold().child("You")).child(div().text_size(TEXT.sm).text_color(tone).child(verb)))
-          .child(summary ? div().text_size(TEXT.sm).whitespace_normal().child(summary) : div().text_size(TEXT.sm).text_color(k.dim).child("No summary.")),
+          .child(summary ? this.md(`rv-md-sum-${keyOf(p)}`, summary) : div().text_size(TEXT.sm).text_color(k.dim).child("No summary.")),
         ...e.rows.filter((r) => r.body.value().trim()).map((r) =>
           v_flex().id(`rv-pv-${r.id}`).gap(6).p(10).rounded(RADIUS.md).border_1().border_color(k.border)
             .child(r.reply_to ? h_flex().gap(6).child(Badge("reply", "secondary")).child(div().text_size(TEXT.xs).text_color(k.dim).truncate().child(r.quote ?? "in the thread")) : Mono(`${r.path.value()}${r.line.value() ? `:${r.line.value()}` : ""}`, { size: TEXT.xs, color: k.foreground }))
-            .child(div().text_size(TEXT.sm).whitespace_normal().child(r.body.value())),
+            .children([!r.reply_to ? this.snippet(k, p, r.path.value().trim(), r.line.value()) : null].filter(Boolean))
+            .child(this.md(`rv-md-${r.id}`, r.body.value())),
         ),
         div().text_size(TEXT.xs).text_color(k.dim).child(`${lines} line comment${lines === 1 ? "" : "s"} and ${replies} repl${replies === 1 ? "y" : "ies"}; empty ones are left out.`),
       );
@@ -211,6 +249,7 @@ export class Drafts {
               )
               .child(Button(`rv-rm-${r.id}`, { label: "Remove", size: "sm", variant: "ghost", onClick: (_e, cx) => { e.rows = e.rows.filter((x) => x !== r); this.queueSave(cx, e); cx.notify(); } })),
           )
+          .children([!r.reply_to ? this.snippet(k, p, r.path.value().trim(), r.line.value()) : null].filter(Boolean))
           .child(this.box(k, r.body)),
       ),
       h_flex().gap(8).child(Button("rv-add", { label: "Add a line comment", icon: "plus", size: "sm", variant: "outline", onClick: (_e, cx) => this.addComment(cx, p) })).children([agentButton].filter(Boolean)),

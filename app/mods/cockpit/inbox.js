@@ -8,6 +8,7 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex, InputState } from "gpui-base";
 import { settings } from "herdr";
 import * as hub from "./hub.js";
+import { prs as cockpitPrs } from "./prsdata.js";
 import {
   tokens, TEXT, RADIUS, Icon, Spinner, Badge, Button, Kbd, PageHeader, SearchField, TextField, KeyHints, Empty, ErrorState,
   Skeleton, Command, Toaster, Flashes, Scroller, Hover, HoverCard, openMenu, alpha, Chip, Mono, ToneButton, Pills,
@@ -810,6 +811,9 @@ export default class Inbox {
     const exact = this.details.get(`pr_merge ${row.key}`)?.value?.ready;
     const r = exact ?? ready;
     if (!r) return null;
+    // Changes were asked but the reviewers were asked again: it waits on them, not on you.
+    const mine = [...(cockpitPrs()?.mine ?? [])].find((p) => p.url === row.key);
+    if (mine?.turn?.why === "re-requested" && r.state === "blocked") return Chip(`Re-review requested: ${mine.reviewers.filter((x) => x.re_requested).map((x) => x.login).join(", ")}`, { color: this.tone("info", k) ?? k.info, icon: "hourglass" });
     const icon = { ready: "git-merge", blocked: "circle-x", waiting: "hourglass", draft: "git-pull-request-draft", queued: "layers", merged: "git-merge" }[r.state] ?? "circle";
     return Chip(r.text.replace(/ · you can't merge.*$/, ""), { color: this.tone(r.tone, k) ?? k.mutedFg, icon });
   }
