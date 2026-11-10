@@ -228,7 +228,7 @@ export class Drafts {
       e.exists ? Button("rv-discard", { label: "Discard", size: "sm", variant: "ghost", onClick: (_e, cx) => this.discard(cx, p) }) : null,
       Button("rv-save", { label: "Save draft", size: "sm", variant: "outline", disabled: empty, onClick: (_e, cx) => { e.chain = e.chain.then(() => this.save(e)).catch(() => {}); notify({ title: "Draft saved", body: `${keyOf(p)} · it stays here until you post it` }); cx.notify(); } }),
       Button("rv-post", { label: this.busy === keyOf(p) ? "Posting…" : "Post review…", size: "sm", disabled: this.busy === keyOf(p) || empty, onClick: (_e, cx) => ((this.confirm = { p }), cx.notify()) }),
-    ]);
+    ].filter(Boolean));
     if (showPreview) {
       const verb = e.verdict === "APPROVE" ? "approved these changes" : e.verdict === "REQUEST_CHANGES" ? "requested changes" : "reviewed";
       return frame(

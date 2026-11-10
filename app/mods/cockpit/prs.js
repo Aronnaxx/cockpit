@@ -68,6 +68,8 @@ export default class Prs {
     this.openThreads = new Set();
     this.worktrees = new Set();
     this.confirm = null;
+    this.merge = new Map();
+    this.rebaseAsk = null;
     this.drafts = new Drafts();
     this.omo = new OmoModel();
     this.omo.follow(cx);
@@ -117,6 +119,7 @@ export default class Prs {
     this.task = null;
     if (!this.convo.has(keyOf(p))) this.readConvo(cx, p);
     this.drafts.load(cx, p).then((c) => c && cx.notify());
+    if (p.role === "author" && (p.behind ?? 0) > 0) this.checkMerge(cx, p);
     const url = p.ci?.builds?.[0];
     if (url && !this.ci.has(url)) {
       this.ci.set(url, "loading");
@@ -201,6 +204,49 @@ export default class Prs {
     });
   }
 
+  /** Would a rebase onto main go through? Tried in a throwaway worktree; the files in conflict when it would not. */
+  checkMerge(cx, p, force = false) {
+    if (!force && this.merge.has(keyOf(p))) return;
+    this.merge.set(keyOf(p), "loading");
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const { home } = await hub.install();
+        const folder = repoFolder(p.repo, this.cfg).replace(/^~/, home);
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-rebase.py`, p.repo, String(p.number), folder, p.branch, p.head], { timeout: 600000 });
+        this.merge.set(keyOf(p), JSON.parse(r.stdout || "{}"));
+      } catch (e) {
+        this.merge.set(keyOf(p), { error: String(e?.message ?? e).slice(0, 160) });
+      }
+      cx.notify();
+    });
+  }
+
+  /** Rebases and force-pushes the branch (after the confirmation), when the check said it is clean. */
+  rebaseNow(cx, p) {
+    cx.spawn(async (cx) => {
+      this.merge.set(keyOf(p), "loading");
+      this.rebaseAsk = null;
+      cx.notify();
+      try {
+        const { home } = await hub.install();
+        const folder = repoFolder(p.repo, this.cfg).replace(/^~/, home);
+        const r = await exec("python3", [`${home}/.local/share/cockpit/herdr/helpers/cockpit-rebase.py`, p.repo, String(p.number), folder, p.branch, p.head, "--push"], { timeout: 600000 });
+        const d = JSON.parse(r.stdout || "{}");
+        if (d.pushed) notify({ title: "Rebased and pushed", body: `${keyOf(p)} is on top of ${p.base} now` });
+        else notify({ title: "Not rebased", body: d.error ?? `Conflicts in ${(d.files ?? []).join(", ")}` });
+        this.merge.delete(keyOf(p));
+        await loadPrs({ force: true });
+        const fresh = this.list().find((x) => keyOf(x) === keyOf(p));
+        if (fresh && (fresh.behind ?? 0) > 0) this.checkMerge(cx, fresh, true);
+      } catch (e) {
+        notify({ title: "Not rebased", body: String(e?.message ?? e).slice(0, 160) });
+        this.merge.delete(keyOf(p));
+      }
+      cx.notify();
+    });
+  }
+
   readCi(cx, url, retry = false) {
     cx.spawn(async (cx) => {
       try {
@@ -219,7 +265,7 @@ export default class Prs {
   /** Starts the picked agent (or `agent`) on a pull request with the task's prompt. */
   start(cx, p, kind, agent = this.agent) {
     cx.spawn(async (cx) => {
-      const ok = await launchAgent({ agent, prompt: prPrompt(kind, { ...p, ci: { failed: this.failedJobs(p) } }), folder: repoFolder(p.repo, this.cfg), name: `${kind} ${p.repo.split("/")[1]}#${p.number}`, model: this.modelValue() });
+      const ok = await launchAgent({ agent, prompt: prPrompt(kind, { ...p, ci: { failed: this.failedJobs(p) }, conflicts: this.merge.get(keyOf(p))?.files }), folder: repoFolder(p.repo, this.cfg), name: `${kind} ${p.repo.split("/")[1]}#${p.number}`, model: this.modelValue() });
       if (ok) notify({ title: "Agent started", body: `${LAUNCH_AGENTS.find((a) => a.id === agent)?.label ?? agent} is on ${keyOf(p)}.` });
       cx.notify();
     });
@@ -358,6 +404,25 @@ export default class Prs {
       );
   }
 
+  /** What a rebase onto main would do, and the buttons for it: rebase now, or hand the conflicts to an agent. */
+  mergeBlock(k, p) {
+    if (p.role !== "author" || (p.behind ?? 0) <= 0) return [];
+    const m = this.merge.get(keyOf(p));
+    const agent = (label, kind) => Button(`prs-${kind}`, { label, icon: "bot", size: "sm", variant: kind === "conflicts" ? "default" : "outline", onClick: (_e, cx) => this.start(cx, p, kind) });
+    if (!m || m === "loading") return [h_flex().gap(8).items_center().text_color(k.mutedFg).text_size(TEXT.sm).child(Spinner({ size: 12 })).child("Trying the rebase in a scratch worktree…")];
+    if (m.error) return [div().text_size(TEXT.sm).text_color(k.warning).child(m.error), h_flex().gap(8).child(agent("Rebase onto main with an agent", "rebase")).child(Button("prs-recheck", { label: "Check again", size: "sm", variant: "ghost", onClick: (_e, cx) => this.checkMerge(cx, p, true) }))];
+    if (m.clean)
+      return [
+        div().text_size(TEXT.sm).text_color(k.success).child("It rebases onto main cleanly."),
+        h_flex().gap(8).child(Button("prs-rebase-now", { label: "Rebase now…", icon: "git-branch", size: "sm", onClick: (_e, cx) => ((this.rebaseAsk = p), cx.notify()) })).child(agent("Rebase with an agent", "rebase")),
+      ];
+    return [
+      div().text_size(TEXT.sm).font_semibold().text_color(k.destructive).child(`Conflicts with ${p.base} in ${m.files.length} file${m.files.length === 1 ? "" : "s"}`),
+      v_flex().gap(2).p(8).rounded(RADIUS.md).bg(alpha(k.destructive, 0.08)).children(m.files.map((f) => div().id(`cf-${f}`).text_size(TEXT.xs).font_family("JetBrains Mono").text_color(k.foreground).child(f))),
+      h_flex().gap(8).child(agent("Resolve conflicts with an agent", "conflicts")).child(Button("prs-recheck", { label: "Check again", size: "sm", variant: "ghost", onClick: (_e, cx) => this.checkMerge(cx, p, true) })),
+    ];
+  }
+
   detail(k, p, cx) {
     const t = p.turn;
     const tc = this.turnColor(k, t);
@@ -447,7 +512,7 @@ export default class Prs {
           section(
             "Up to date with main",
             div().text_size(TEXT.sm).text_color((p.behind ?? 0) > 0 ? k.warning : k.mutedFg).child((p.behind ?? 0) > 0 ? `${p.behind} commit${p.behind === 1 ? "" : "s"} behind ${p.base}. Always brought up by rebasing, never by merging.` : `Up to date with ${p.base}.`),
-            (p.behind ?? 0) > 0 ? Button("prs-rebase", { label: "Rebase onto main with an agent", icon: "git-branch", size: "sm", variant: "outline", onClick: (_e, cx) => this.start(cx, p, "rebase") }) : null,
+            ...this.mergeBlock(k, p),
           ),
         ),
       )
@@ -606,6 +671,18 @@ export default class Prs {
           }),
         );
       })
+      .when(Boolean(this.rebaseAsk), (e) =>
+        e.child(
+          AlertDialog("prs-rebase-ask", {
+            title: `Rebase ${this.rebaseAsk.repo.split("/")[1]}#${this.rebaseAsk.number} onto ${this.rebaseAsk.base}?`,
+            description: `The branch ${this.rebaseAsk.branch} is rebased in a scratch worktree and force-pushed (only if nobody pushed to it meanwhile). Reviewers see the history rewritten.`,
+            confirmLabel: "Rebase and push",
+            destructive: true,
+            onCancel: (_e, cx) => ((this.rebaseAsk = null), cx.notify()),
+            onConfirm: (_e, cx) => this.rebaseNow(cx, this.rebaseAsk),
+          }),
+        ),
+      )
       .when(Boolean(this.confirm), (e) =>
         e.child(
           AlertDialog("prs-confirm", {
