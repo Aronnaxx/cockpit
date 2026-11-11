@@ -29,7 +29,7 @@ test('a brief line about several PRs opens the search that lists them', async ()
   expect(query(failing?.url)).toBe('is:pr is:open archived:false author:@me status:failure')
 
   const changes = lineFor(inbox({ mine: [pr(1, { review: 'CHANGES_REQUESTED' }), pr(2, { review: 'CHANGES_REQUESTED' })] }), 'changes')
-  expect(query(changes?.url)).toBe('is:pr is:open archived:false author:@me review:changes-requested')
+  expect(query(changes?.url)).toBe('is:pr is:open archived:false author:@me review:changes_requested')
 
   const reviews = lineFor(inbox({ direct: [pr(1), pr(2)] }), 'review', 'o')
   expect(query(reviews?.url)).toBe('is:pr is:open archived:false user-review-requested:@me')

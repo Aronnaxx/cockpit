@@ -77,7 +77,7 @@ export function compose(inbox: Inbox, ci: CiState | null, meetings: MeetingsStat
   }
   const changes = inbox.mine.filter(pr => pr.review === 'CHANGES_REQUESTED')
   if (changes.length > 0) {
-    lines.push({ icon: 'changes', text: `changes requested on ${refs(changes)}`, url: link(changes, `${mine} review:changes-requested`), tone: 'warn' })
+    lines.push({ icon: 'changes', text: `changes requested on ${refs(changes)}`, url: link(changes, `${mine} review:changes_requested`), tone: 'warn' })
   }
   const ready = inbox.mine.filter(pr => pr.review === 'APPROVED' && pr.ci === 'SUCCESS')
   if (ready.length > 0) {
